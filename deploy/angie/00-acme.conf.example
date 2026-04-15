@@ -1,0 +1,5 @@
+resolver 1.1.1.1 1.0.0.1 valid=300s ipv6=off;
+resolver_timeout 10s;
+
+# Можно добавить email=admin@example.com при желании.
+acme_client le https://acme-v02.api.letsencrypt.org/directory;

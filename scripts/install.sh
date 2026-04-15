@@ -24,8 +24,9 @@ APP_SERVICE="ytd_web"
 BACKUP_DIR="/opt/telegram-bots/ytd_web/backups/db"
 WEB_HOST="127.0.0.1"
 WEB_PORT="8093"
-APT_PACKAGES="git ca-certificates curl unzip ffmpeg nodejs python3 python3-venv python3-pip sqlite3 cron ufw rsync"
+APT_PACKAGES="git ca-certificates curl unzip ffmpeg nodejs python3 python3-venv python3-pip sqlite3 cron ufw rsync gnupg"
 ANGIE_REPO_CHANNEL="main"
+ACME_RESOLVER="1.1.1.1 1.0.0.1 valid=300s ipv6=off"
 
 if [[ -n "${VERSIONS_FILE}" && -f "${VERSIONS_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -44,6 +45,7 @@ DOWNLOAD_BASE_URL_INPUT="${DOWNLOAD_BASE_URL_INPUT:-}"
 WEB_SECRET_KEY_INPUT="${WEB_SECRET_KEY_INPUT:-}"
 WEB_LOGIN_KEY_INPUT="${WEB_LOGIN_KEY_INPUT:-}"
 WEB_ADMIN_LOGIN_KEY_INPUT="${WEB_ADMIN_LOGIN_KEY_INPUT:-}"
+ACME_EMAIL_INPUT="${ACME_EMAIL_INPUT:-}"
 
 usage() {
   cat <<USAGE
@@ -63,6 +65,7 @@ usage() {
   WEB_SECRET_KEY_INPUT=...
   WEB_LOGIN_KEY_INPUT=...
   WEB_ADMIN_LOGIN_KEY_INPUT=...
+  ACME_EMAIL_INPUT=admin@example.com
   NONINTERACTIVE=1
   INSTALL_VERSIONS_FILE=/путь/к/install-versions.env
 USAGE
@@ -93,7 +96,7 @@ fi
 
 has_local_source() {
   local d="$1"
-  [[ -f "${d}/web_ytd.py" && -f "${d}/requirements.txt" && -d "${d}/templates" && -d "${d}/static" ]]
+  [[ -f "${d}/web_ytd.py" && -f "${d}/requirements.txt" && -d "${d}/templates" && -d "${d}/static" && -d "${d}/deploy" ]]
 }
 
 prompt_or_default() {
@@ -125,9 +128,56 @@ PY
   fi
 }
 
+ensure_angie_http_include_conf_d() {
+  python3 - <<'PY'
+from pathlib import Path
+path = Path('/etc/angie/angie.conf')
+text = path.read_text(encoding='utf-8')
+needle = 'include /etc/angie/conf.d/*.conf;'
+if needle in text:
+    raise SystemExit(0)
+marker = '    include /etc/angie/http.d/*.conf;'
+if marker in text:
+    text = text.replace(marker, '    include /etc/angie/conf.d/*.conf;\n' + marker, 1)
+else:
+    http_start = text.find('http {')
+    if http_start == -1:
+        raise SystemExit('Не найден блок http {} в /etc/angie/angie.conf')
+    insert_pos = text.find('\n}', http_start)
+    if insert_pos == -1:
+        raise SystemExit('Не найден конец блока http {} в /etc/angie/angie.conf')
+    text = text[:insert_pos] + '\n    include /etc/angie/conf.d/*.conf;' + text[insert_pos:]
+path.write_text(text, encoding='utf-8')
+PY
+}
+
+disable_angie_default_site() {
+  if [[ -f /etc/angie/http.d/default.conf ]]; then
+    mv -f /etc/angie/http.d/default.conf /etc/angie/http.d/default.conf.disabled
+  fi
+}
+
+render_acme_conf() {
+  if [[ -n "${ACME_EMAIL_INPUT}" ]]; then
+    cat <<EOF2
+resolver ${ACME_RESOLVER};
+resolver_timeout 10s;
+
+acme_client le https://acme-v02.api.letsencrypt.org/directory email=${ACME_EMAIL_INPUT};
+EOF2
+  else
+    cat <<EOF2
+resolver ${ACME_RESOLVER};
+resolver_timeout 10s;
+
+acme_client le https://acme-v02.api.letsencrypt.org/directory;
+EOF2
+  fi
+}
+
 echo "==> Подготовка базовых пакетов"
 apt-get update
-apt-get install -y ca-certificates curl git
+apt-get install -y ca-certificates curl git gnupg
 
 if [[ "${INSTALL_MODE}" == "auto" ]]; then
   if [[ -n "${GIT_REPO_URL}" ]]; then
@@ -163,7 +213,7 @@ if [[ "${INSTALL_MODE}" == "git" ]]; then
 elif [[ "${INSTALL_MODE}" == "local" ]]; then
   if ! has_local_source "${LOCAL_SOURCE_DIR}"; then
     echo "Не найден локальный набор файлов проекта в ${LOCAL_SOURCE_DIR}" >&2
-    echo "Ожидаются: web_ytd.py, requirements.txt, templates/, static/" >&2
+    echo "Ожидаются: web_ytd.py, requirements.txt, templates/, static/, deploy/" >&2
     exit 1
   fi
   SOURCE_ROOT="${LOCAL_SOURCE_DIR}"
@@ -199,16 +249,19 @@ fi
 if [[ -z "${WEB_ADMIN_LOGIN_KEY_INPUT}" ]]; then
   WEB_ADMIN_LOGIN_KEY_INPUT="$(gen_hex 16)"
 fi
+if [[ -z "${ACME_EMAIL_INPUT}" ]]; then
+  ACME_EMAIL_INPUT="$(prompt_or_default "Введите email для ACME/Let's Encrypt (можно оставить пустым)" '')"
+fi
 
 echo "==> Установка пакетов ОС"
 apt-get update
 apt-get install -y ${APT_PACKAGES}
 
-if [[ ! -f /etc/apt/trusted.gpg.d/angie-signing.gpg ]]; then
-  curl -fsSL -o /etc/apt/trusted.gpg.d/angie-signing.gpg https://angie.software/keys/angie-signing.gpg
-fi
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://angie.software/keys/angie-signing.gpg | gpg --dearmor -o /etc/apt/keyrings/angie-signing.gpg
+chmod 644 /etc/apt/keyrings/angie-signing.gpg
 
-echo "deb https://download.angie.software/angie/$(. /etc/os-release && echo "$ID/$VERSION_ID $VERSION_CODENAME") ${ANGIE_REPO_CHANNEL}" \
+echo "deb [signed-by=/etc/apt/keyrings/angie-signing.gpg] https://download.angie.software/angie/$(. /etc/os-release && echo "$ID/$VERSION_ID $VERSION_CODENAME") ${ANGIE_REPO_CHANNEL}" \
   > /etc/apt/sources.list.d/angie.list
 
 apt-get update
@@ -217,14 +270,13 @@ systemctl enable --now angie
 systemctl enable --now cron
 
 echo "==> Создание пользователя и каталогов"
-mkdir -p "${APP_HOME}"
-mkdir -p "${APP_DIR}"
-mkdir -p "${DOWNLOAD_DIR}"
-
 if ! id -u "${APP_USER}" >/dev/null 2>&1; then
   adduser --home "${APP_HOME}" --shell /bin/bash --disabled-password --gecos "" "${APP_USER}"
 fi
 
+mkdir -p "${APP_HOME}"
+mkdir -p "${APP_DIR}"
+mkdir -p "${DOWNLOAD_DIR}"
 mkdir -p \
   "${APP_DIR}/static" \
   "${APP_DIR}/templates" \
@@ -374,13 +426,17 @@ sed \
 systemctl daemon-reload
 systemctl enable --now "${APP_SERVICE}"
 
-echo "==> Установка конфигов Angie"
+echo "==> Настройка Angie"
 mkdir -p /etc/angie/conf.d /etc/angie/http.d
+ensure_angie_http_include_conf_d
+disable_angie_default_site
+render_acme_conf > /etc/angie/http.d/00-acme.conf
 cp -f "${APP_DIR}/deploy/angie/download_filename_map.conf" /etc/angie/conf.d/download_filename_map.conf
 
 sed \
   -e "s|__APP_DOMAIN__|${APP_DOMAIN}|g" \
   -e "s|__WEB_BASE_PATH__|${WEB_BASE_PATH_INPUT}|g" \
+  -e "s|__WEB_PORT__|${WEB_PORT}|g" \
   "${APP_DIR}/deploy/angie/site.conf.example" > "/etc/angie/http.d/${APP_DOMAIN}.conf"
 
 angie -t
@@ -398,7 +454,7 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 */5 * * * * root find ${DOWNLOAD_DIR} -type f -mmin +30 -delete
-0 4 * * * root before=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\"yt-dlp=NOT_INSTALLED\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\"yt-dlp-ejs=NOT_INSTALLED\\")"'); /usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && pip install -U --no-deps yt-dlp yt-dlp-ejs'; after=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\"yt-dlp=NOT_INSTALLED\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\"yt-dlp-ejs=NOT_INSTALLED\\")"'); [ "\$before" != "\$after" ] && /usr/bin/systemctl restart ${APP_SERVICE} || true
+0 4 * * * root before=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); /usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && pip install -U --no-deps yt-dlp yt-dlp-ejs'; after=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); [ "\$before" != "\$after" ] && /usr/bin/systemctl restart ${APP_SERVICE} || true
 CRONEOF
 chmod 644 /etc/cron.d/ytd_web
 
@@ -417,11 +473,15 @@ echo "Каталог проекта:     ${APP_DIR}"
 echo "Виртуальное окруж.:  ${VENV_DIR}"
 echo "Служба:              ${APP_SERVICE}"
 echo
-echo "Проверь:"
+echo "Ссылки входа:"
+echo "  Пользователь: ${WEB_PUBLIC_BASE_URL_INPUT}${WEB_BASE_PATH_INPUT}/login?key=${WEB_LOGIN_KEY_INPUT}"
+echo "  Админ:        ${WEB_PUBLIC_BASE_URL_INPUT}${WEB_BASE_PATH_INPUT}/login?key=${WEB_ADMIN_LOGIN_KEY_INPUT}"
+echo
+echo "Полезные команды:"
 echo "  systemctl status ${APP_SERVICE} --no-pager"
 echo "  systemctl status angie --no-pager"
 echo "  ufw status verbose"
+echo "  grep -i acme /var/log/angie/error.log | tail -n 50"
+echo "  ls -la /var/lib/angie/acme/le/"
 echo
-echo "Ссылки входа будут такими:"
-echo "  Пользователь: https://${APP_DOMAIN}${WEB_BASE_PATH_INPUT}/login?key=${WEB_LOGIN_KEY_INPUT}"
-echo "  Админ:        https://${APP_DOMAIN}${WEB_BASE_PATH_INPUT}/login?key=${WEB_ADMIN_LOGIN_KEY_INPUT}"
+echo "Если HTTPS сразу не поднимется, сначала проверь внешнюю доступность TCP/80 до сервера."
