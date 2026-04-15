@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Web YTD</title>
+  <link rel="stylesheet" href="{{ request.url_for('static', path='style.css') }}">
+</head>
+<body data-base-path="{{ base_path }}" data-theme="dark">
+  <div class="page-shell">
+    <header class="hero card">
+      <div class="hero-left">
+        <h1>Скачивание видео</h1>
+        <p class="hero-text">
+          Закрытая веб-версия сервиса для скачивания видео и аудио.
+        </p>
+      </div>
+
+      <div class="hero-right hero-actions">
+        <button id="theme-toggle" class="ghost-btn theme-toggle-btn" type="button">
+          Светлая тема
+        </button>
+        <a class="ghost-btn" href="{{ base_path }}/logout">Выйти</a>
+      </div>
+    </header>
+
+    <main class="dashboard-grid">
+      <section class="main-column">
+        <section class="card section-card section-card-main">
+          <div class="section-head">
+            <div>
+              <h2>Видео по ссылке</h2>
+              <p class="section-subtext">
+                Вставь ссылку, дождись анализа и выбери формат, режим скачивания или обложку.
+              </p>
+            </div>
+          </div>
+
+          <form id="analyze-form" class="stack-16">
+            <label class="field-label" for="video-url">Ссылка на видео</label>
+
+            <div class="analyze-row">
+              <input
+                id="video-url"
+                name="url"
+                type="url"
+                class="text-input"
+                placeholder="https://www.youtube.com/watch?v=..."
+                required
+              >
+              <button id="analyze-submit" class="primary-btn analyze-btn" type="submit">
+                Анализировать
+              </button>
+            </div>
+          </form>
+
+          <div id="analysis-loading" class="analysis-loading hidden" aria-live="polite">
+            <div class="spinner"></div>
+            <div class="analysis-loading-text">
+              <strong>Идёт анализ ссылки…</strong>
+              <span>Пожалуйста, подожди несколько секунд.</span>
+            </div>
+          </div>
+
+          <div id="analysis-empty" class="empty-state analysis-empty-block">
+            Вставь ссылку и нажми «Анализировать».
+          </div>
+
+          <div id="analysis-box" class="stack-20 hidden">
+            <div class="video-summary">
+              <div class="video-summary-head">
+                <h3 id="video-title">—</h3>
+              </div>
+              <p id="video-url-view" class="muted break-all"></p>
+            </div>
+
+            <div class="download-actions">
+              <button class="secondary-btn action-btn" type="button" data-mode="bestq">Лучшее качество</button>
+              <button class="secondary-btn action-btn" type="button" data-mode="any">Любой формат</button>
+              <button class="secondary-btn action-btn" type="button" data-mode="audio">MP3</button>
+              <button id="thumbnail-btn" class="secondary-btn action-btn hidden" type="button">Обложка</button>
+            </div>
+
+            <div>
+              <div class="section-title">Доступные форматы</div>
+              <div id="formats-list" class="formats-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card section-card section-card-main">
+          <div class="section-head">
+            <div>
+              <h2>Текущая задача</h2>
+              <p class="section-subtext">
+                Здесь отображается ход выполнения текущего скачивания.
+              </p>
+            </div>
+          </div>
+
+          <div id="task-placeholder" class="empty-state">
+            Пока нет активной задачи.
+          </div>
+
+          <div id="task-box" class="hidden stack-16">
+            <div class="task-header">
+              <div class="task-info">
+                <div id="task-status-badge" class="status-badge">—</div>
+                <h3 id="task-title">—</h3>
+                <p id="task-detail" class="muted">—</p>
+              </div>
+            </div>
+
+            <div class="progress-wrap" id="task-progress-wrap">
+              <div id="task-progress" class="progress-bar is-active"></div>
+            </div>
+
+            <div id="task-result" class="hidden result-box">
+              <a
+                id="task-download-link"
+                class="primary-btn"
+                href="#"
+                target="_blank"
+                rel="noopener"
+              >
+                Скачать готовый файл
+              </a>
+            </div>
+
+            <div id="task-error" class="hidden error-box"></div>
+          </div>
+        </section>
+
+        <section class="card section-card section-card-main history-card-main">
+          <div class="section-head">
+            <div>
+              <h2>Последние задачи</h2>
+              <p class="section-subtext">
+                Последние действия текущего пользователя сервиса.
+              </p>
+            </div>
+          </div>
+
+          {% if history %}
+            <div class="history-list">
+              {% for item in history %}
+                <article class="history-item">
+                  <div class="history-main">
+                    <strong>{{ item.title or 'Видео' }}</strong>
+
+                    <div class="muted history-meta">
+                      <span class="js-date" data-date="{{ item.created_at }}"></span> • {{ item.mode }}
+                    </div>
+                  </div>
+
+                  <div class="history-side history-side-stack">
+                    {% if item.status == 'done' and item.download_url and item.file_exists %}
+                      <a class="ghost-btn small-btn" href="{{ item.download_url }}" target="_blank" rel="noopener">Файл</a>
+                    {% elif item.status == 'done' and item.download_url and not item.file_exists %}
+                      <span class="status-inline status-missing">Файл удалён</span>
+                    {% else %}
+                      <span class="status-inline status-error">Ошибка</span>
+                    {% endif %}
+
+                    {% if item.source_url %}
+                      <a class="ghost-btn small-btn" href="{{ item.source_url }}" target="_blank" rel="noopener">Источник</a>
+                    {% endif %}
+                  </div>
+                </article>
+              {% endfor %}
+            </div>
+          {% else %}
+            <div class="empty-state">
+              История пока пуста.
+            </div>
+          {% endif %}
+        </section>
+      </section>
+
+      <aside class="side-column">
+        <section class="card section-card side-card">
+          <div class="section-head">
+            <div>
+              <h2>Мой cookies.txt</h2>
+              <p class="section-subtext">
+                Нужен только если источник требует авторизацию.
+              </p>
+            </div>
+          </div>
+
+          <div id="cookies-status" class="cookie-status {{ cookie_state.status_class }}">
+            {{ cookie_state.status_text }}
+          </div>
+
+          <p id="cookies-helper-text" class="muted helper-text">{{ cookie_state.helper_text }}</p>
+
+          <p id="cookies-meta-text" class="muted helper-text helper-text-compact">
+            {% if cookie_state.uploaded_at %}
+              Последнее обновление:
+              <span class="js-date" data-date="{{ cookie_state.uploaded_at }}"></span>
+            {% endif %}
+          </p>
+
+          <form id="cookies-form" class="stack-12 cookies-form-block">
+            <input
+              id="cookie-file"
+              name="file"
+              class="file-input"
+              type="file"
+              accept=".txt"
+              required
+            >
+            <button class="primary-btn" type="submit">Загрузить мой cookies.txt</button>
+          </form>
+
+          <button id="delete-cookies-btn" class="ghost-btn danger-btn full-width-btn cookies-delete-btn" type="button">
+            Удалить мой cookies.txt
+          </button>
+        </section>
+
+        {% if user.get("is_admin", False) %}
+          <section class="card section-card side-card admin-side-card">
+            <div class="section-head">
+              <div>
+                <h2>Состояние сервиса</h2>
+                <p class="section-subtext">
+                  Быстрый контроль активности и подсказка, безопасно ли сейчас делать перезапуск.
+                </p>
+              </div>
+            </div>
+
+            <div class="admin-note-row muted">
+              В этой сводке учитываются только обычные пользователи. Администратор в счётчики активности не входит.
+            </div>
+
+            <div id="admin-stats" class="stats-grid compact-stats-grid">
+              <div class="stat-box">
+                <div class="stat-label">Пользователи за 5 минут</div>
+                <div id="stat-active-5" class="stat-value">—</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Пользователи за 10 минут</div>
+                <div id="stat-active-10" class="stat-value">—</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Активные скачивания</div>
+                <div id="stat-active-tasks" class="stat-value">—</div>
+              </div>
+              <div class="stat-box stat-box-accent">
+                <div class="stat-label">Сейчас можно перезапускать</div>
+                <div id="stat-safe-restart" class="stat-value">—</div>
+              </div>
+            </div>
+
+            <div class="info-card-group admin-tools-group">
+              <div class="info-card">
+                <div class="section-title">Постоянная ссылка входа</div>
+                <div class="copy-line admin-copy-line">
+                  <input id="universal-login-url" class="text-input mono-input" type="text" value="" readonly>
+                  <button id="copy-universal-login-btn" class="ghost-btn small-btn" type="button">Копировать</button>
+                </div>
+              </div>
+
+              <div class="info-card">
+                <div class="section-title">Активные скачивания у пользователей</div>
+                <div id="admin-active-tasks" class="stack-12">
+                  <div class="empty-state compact-empty">Пока нет активных скачиваний.</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="card section-card side-card admin-side-card">
+            <div class="section-head">
+              <div>
+                <h2>Разовые ссылки доступа</h2>
+                <p class="section-subtext">
+                  Создай новую ссылку и подпиши её именем или тегом, чтобы потом было понятно, кому она выдана.
+                </p>
+              </div>
+            </div>
+
+            <form id="invite-create-form" class="stack-16">
+              <div>
+                <label class="field-label" for="invite-label">Имя / тег доступа</label>
+                <input id="invite-label" name="label" class="text-input" type="text" maxlength="160" placeholder="Например: Иван, тестовый доступ, монтажёр №2">
+              </div>
+              <button id="invite-create-btn" class="primary-btn full-width-btn" type="submit">Создать ссылку</button>
+            </form>
+
+            <div id="latest-invite-box" class="hidden latest-invite-box stack-12">
+              <div class="section-title">Последняя созданная ссылка</div>
+              <div class="copy-line copy-line-column">
+                <input id="latest-invite-url" class="text-input mono-input" type="text" value="" readonly>
+                <div class="copy-actions-row copy-actions-row-fill">
+                  <button id="copy-latest-invite-btn" class="ghost-btn small-btn" type="button">Копировать</button>
+                  <a id="open-latest-invite-btn" class="ghost-btn small-btn" href="#" target="_blank" rel="noopener">Открыть</a>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="card section-card side-card admin-side-card">
+            <div class="section-head">
+              <div>
+                <h2>Общий cookies администратора</h2>
+                <p class="section-subtext">
+                  Используется по умолчанию для всех пользователей, у которых нет своего личного cookies.txt.
+                </p>
+              </div>
+            </div>
+
+            <div id="admin-cookies-status" class="cookie-status {{ admin_cookie_state.status_class }}">
+              {{ admin_cookie_state.status_text }}
+            </div>
+
+            <p id="admin-cookies-helper-text" class="muted helper-text">{{ admin_cookie_state.helper_text }}</p>
+
+            <p id="admin-cookies-meta-text" class="muted helper-text helper-text-compact">
+              {% if admin_cookie_state.uploaded_at %}
+                Последнее обновление:
+                <span class="js-date" data-date="{{ admin_cookie_state.uploaded_at }}"></span>
+              {% endif %}
+            </p>
+
+            <form id="admin-cookies-form" class="stack-12 cookies-form-block">
+              <input
+                id="admin-cookie-file"
+                name="file"
+                class="file-input"
+                type="file"
+                accept=".txt"
+                required
+              >
+              <button class="primary-btn" type="submit">Загрузить общий cookies.txt</button>
+            </form>
+
+            <button id="delete-admin-cookies-btn" class="ghost-btn danger-btn full-width-btn cookies-delete-btn" type="button">
+              Удалить общий cookies.txt
+            </button>
+          </section>
+        {% endif %}
+      </aside>
+    </main>
+
+    {% if user.get("is_admin", False) %}
+      <section class="admin-bottom-section">
+        <section class="card section-card admin-card admin-wide-card">
+          <div class="section-head">
+            <div>
+              <h2>Выданные доступы</h2>
+              <p class="section-subtext">
+                Список созданных разовых ссылок: статус, последнее использование, скачивания и быстрое удаление доступа.
+              </p>
+            </div>
+          </div>
+
+          <div id="invites-empty" class="empty-state hidden">
+            Пока ни одной разовой ссылки не создано.
+          </div>
+
+          <div id="invites-list" class="invite-list"></div>
+        </section>
+      </section>
+    {% endif %}
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <script>
+    window.APP_CONFIG = {
+      BASE_PATH: {{ base_path | tojson }},
+      IS_ADMIN: {{ user.get("is_admin", False) | tojson }}
+    };
+  </script>
+  <script src="{{ request.url_for('static', path='app.js') }}"></script>
+</body>
+</html>

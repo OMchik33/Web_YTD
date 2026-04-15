@@ -1,0 +1,54 @@
+# Перенаправление с HTTP на HTTPS
+server {
+    listen 80 default_server;
+    server_name __APP_DOMAIN__;
+    return 301 https://$host$request_uri;
+}
+
+# Основной сайт на HTTPS порту 443
+server {
+    listen 443 ssl default_server;
+    http2 on;
+
+    server_name __APP_DOMAIN__;
+
+    # Встроенный ACME в Angie
+    acme le;
+    ssl_certificate      $acme_cert_le;
+    ssl_certificate_key  $acme_cert_key_le;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers  HIGH:!aNULL:!MD5;
+
+    access_log /var/log/angie/__APP_DOMAIN__.access.log;
+    error_log  /var/log/angie/__APP_DOMAIN__.error.log;
+
+    # Раздача скачанных файлов
+    location /files/ {
+        alias /download/;
+        autoindex off;
+        try_files $uri =404;
+        add_header Content-Disposition $download_disposition;
+    }
+
+    # Само приложение под скрытым путём
+    location __WEB_BASE_PATH__/ {
+        proxy_pass http://127.0.0.1:8093__WEB_BASE_PATH__/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+    }
+
+    # Всё остальное можно закрыть
+    # location / {
+    #     return 404;
+    #     access_log off;
+    #     log_not_found off;
+    # }
+}

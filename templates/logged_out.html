@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Web YTD</title>
+  <link rel="stylesheet" href="{{ request.url_for('static', path='style.css') }}">
+</head>
+<body data-base-path="{{ base_path }}" data-theme="dark">
+  <div class="page-shell page-shell-narrow">
+    <section class="card section-card auth-card auth-card-centered">
+      <div class="auth-badge">Состояние доступа</div>
+      <h1 class="auth-title">{{ title_text }}</h1>
+      <p class="hero-text auth-text">{{ lead_text }}</p>
+      <div class="empty-state auth-note-box">{{ note_text }}</div>
+    </section>
+  </div>
+</body>
+</html>
