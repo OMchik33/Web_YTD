@@ -58,12 +58,11 @@ sudo bash scripts/install.sh
 ### Вариант B — установка из GitHub/Git
 
 ```bash
-unzip ytd_repo_bundle_v2.zip -d /root/web-ytd-installer
+apt update
+apt install -y git
+git clone https://github.com/OMchik33/Web_YTD.git /root/web-ytd-installer
 cd /root/web-ytd-installer
-sudo INSTALL_MODE=git \
-  GIT_REPO_URL="https://github.com/OMchik33/Web_YTD.git" \
-  GIT_BRANCH="main" \
-  bash scripts/install.sh
+sudo bash scripts/install.sh
 ```
 
 В этом режиме `install.sh` сам клонирует проект из GitHub и развернёт его в рабочий каталог.
