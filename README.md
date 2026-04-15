@@ -364,6 +364,9 @@ sudo bash scripts/ytd_db.sh integrity-check
 sudo bash scripts/ytd_db.sh vacuum-into
 ```
 
+Также можно сразу запустить `bash ytd_db.sh` без параметров и скрипт предложит меню выбора действий.
+
+
 Что важно:
 
 - перед любым restore скрипт сам создаёт аварийный backup текущей БД;
