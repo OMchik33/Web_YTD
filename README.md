@@ -4,6 +4,8 @@ Web YTD — это приватный веб‑сервис на FastAPI для 
 
 <img width="1733" height="1029" alt="2026-04-15_20-41-31" src="https://github.com/user-attachments/assets/fc76b8c8-0a30-46d8-bb06-7531df8f9263" />
 
+ВНИМАНИЕ: ПРОЕКТ НА СТАДИИ ПРЕДВАРИТЕЛЬНОГО ТЕСТИРОВАНИЯ!
+
 
 ## Возможности
 
