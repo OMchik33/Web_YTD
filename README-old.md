@@ -92,8 +92,164 @@ sudo ufw status verbose
 
 ---
 
+## Полная установка с нуля для новичка
 
-### Cron: автообновление `yt-dlp` и очистка `/download`
+### 1. Что нужно заранее
+
+- Ubuntu Server 24.04 LTS;
+- домен с A‑записью на IP сервера;
+- доступ по SSH с `sudo`;
+- открытые порты `22`, `80`, `443`.
+
+### 2. Подготовка DNS и сервера
+
+Сделай A‑запись домена на IP сервера и дождись, пока домен начнёт резолвиться на этот IP.
+
+Обнови систему:
+
+```bash
+sudo apt update
+sudo apt upgrade -y
+```
+
+### 3. Установка пакетов ОС
+
+```bash
+sudo apt update
+sudo apt install -y git ca-certificates curl unzip ffmpeg nodejs python3 python3-venv python3-pip sqlite3 cron ufw rsync
+```
+
+### 4. Установка Angie из официального репозитория
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo curl -fsSL -o /etc/apt/trusted.gpg.d/angie-signing.gpg https://angie.software/keys/angie-signing.gpg
+
+echo "deb https://download.angie.software/angie/$(. /etc/os-release && echo "$ID/$VERSION_ID $VERSION_CODENAME") main" \
+| sudo tee /etc/apt/sources.list.d/angie.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y angie
+sudo systemctl enable --now angie
+```
+
+### 5. Настройка UFW
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw --force enable
+sudo ufw status verbose
+```
+
+### 6. Создание пользователя и каталогов
+
+```bash
+sudo adduser --home /opt/telegram-bots --shell /bin/bash --disabled-password --gecos "" botrunner
+sudo mkdir -p /opt/telegram-bots/ytd_web
+sudo mkdir -p /download
+sudo mkdir -p /opt/telegram-bots/ytd_web/{static,templates,cookies,data,logs,deploy,backups,scripts}
+sudo chown -R botrunner:botrunner /opt/telegram-bots
+sudo chown -R botrunner:botrunner /download
+```
+
+### 7. Размещение файлов проекта
+
+Скопируй в `/opt/telegram-bots/ytd_web`:
+
+- `web_ytd.py`
+- `requirements.txt`
+- `.env.example`
+- `templates/index.html`
+- `templates/logged_out.html`
+- `static/app.js`
+- `static/style.css`
+- `deploy/systemd/ytd_web.service`
+- `deploy/angie/site.conf.example`
+- `deploy/angie/download_filename_map.conf`
+- `deploy/cron/crontab.example`
+- `scripts/ytd_db.sh`
+
+### 8. Создание виртуального окружения и установка зависимостей
+
+```bash
+sudo -u botrunner -H python3 -m venv /opt/telegram-bots/venv
+sudo -u botrunner -H bash -lc 'source /opt/telegram-bots/venv/bin/activate && pip install --upgrade pip setuptools wheel && pip install -r /opt/telegram-bots/ytd_web/requirements.txt'
+```
+
+### 9. Создание `.env`
+
+Скопируй `.env.example` в `.env` и отредактируй значения:
+
+```bash
+sudo -u botrunner cp /opt/telegram-bots/ytd_web/.env.example /opt/telegram-bots/ytd_web/.env
+sudo -u botrunner nano /opt/telegram-bots/ytd_web/.env
+```
+
+Обязательно поменяй:
+
+- `WEB_BASE_PATH`
+- `WEB_PUBLIC_BASE_URL`
+- `WEB_SECRET_KEY`
+- `WEB_LOGIN_KEY`
+- `WEB_ADMIN_LOGIN_KEY`
+- `DOWNLOAD_BASE_URL`
+
+### 10. Настройка Angie под домен
+
+Убедись, что в `/etc/angie/angie.conf` внутри блока `http {}` есть оба include:
+
+```nginx
+include /etc/angie/conf.d/*.conf;
+include /etc/angie/http.d/*.conf;
+```
+
+Скопируй:
+
+deploy/angie/download_filename_map.conf → /etc/angie/conf.d/download_filename_map.conf
+deploy/angie/00-acme.conf.example → /etc/angie/http.d/00-acme.conf
+deploy/angie/site.conf.example → /etc/angie/http.d/your-domain.conf
+
+Проверка и перезагрузка:
+
+```bash
+sudo angie -t
+sudo systemctl reload angie
+```
+
+### 11. Получение и обновление сертификатов
+
+В примере конфига используется встроенный ACME Angie (`acme le;`).
+
+Для его работы необходимо:
+
+- чтобы домен уже смотрел на IP сервера;
+- чтобы входящий `80/tcp` был реально доступен извне;
+- чтобы в Angie были настроены:
+  - `resolver`,
+  - `acme_client le ...`,
+  - конфиг домена с `acme le;`.
+
+Если сертификат не выпускается, проверь:
+
+```bash
+sudo angie -t
+sudo systemctl status angie --no-pager
+sudo grep -RniE 'acme|challenge|certificate|letsencrypt' /var/log/angie/*.log
+```
+
+### 12. Создание службы systemd
+
+```bash
+sudo cp /opt/telegram-bots/ytd_web/deploy/systemd/ytd_web.service /etc/systemd/system/ytd_web.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ytd_web
+sudo systemctl status ytd_web --no-pager
+```
+
+### 13. Cron: автообновление `yt-dlp` и очистка `/download`
 
 В проекте используется **не пользовательский `crontab -e`**, а отдельный системный cron-файл:
 
@@ -150,7 +306,7 @@ grep CRON /var/log/syslog | tail -n 50
 
 ```
 
-### 14. Проверка после установки (не обязательно)
+### 14. Проверка после установки
 
 Проверь:
 
@@ -220,4 +376,4 @@ web-ytd/
 - Сам сервис работает не в корне домена, а под `WEB_BASE_PATH`.
 - `WEB_PORT` наружу открывать не нужно, потому что FastAPI слушает `127.0.0.1`.
 - SQLite хранит только метаданные. Видео, логи и `cookies.txt` остаются файлами на диске.
-- Для YouTube и `yt-dlp-ejs` нужен установленный `node` (ставится скриптом автоустановщиком).
+- Для YouTube и `yt-dlp-ejs` нужен установленный `node`.
