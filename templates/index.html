@@ -74,11 +74,28 @@
               <p id="video-url-view" class="muted break-all"></p>
             </div>
 
+            <div class="quality-panel">
+              <label class="field-label" for="quality-select">Качество перед скачиванием</label>
+              <select id="quality-select" class="text-input">
+                <option value="720">720p</option>
+                <option value="1080" selected>1080p</option>
+                <option value="1440">1440p</option>
+                <option value="2160">4K / 2160p</option>
+              </select>
+              <p class="muted helper-text helper-text-compact">
+                Выбирай качество до скачивания, чтобы не хранить на сервере лишние копии одного видео.
+              </p>
+            </div>
+
             <div class="download-actions">
-              <button class="secondary-btn action-btn" type="button" data-mode="bestq">Лучшее качество</button>
-              <button class="secondary-btn action-btn" type="button" data-mode="any">Любой формат</button>
+              <button class="secondary-btn action-btn" type="button" data-mode="bestq">Скачать видео</button>
               <button class="secondary-btn action-btn" type="button" data-mode="audio">MP3</button>
+              <button id="proxy-download-btn" class="secondary-btn action-btn hidden" type="button">Экспериментально без хранения</button>
               <button id="thumbnail-btn" class="secondary-btn action-btn hidden" type="button">Обложка</button>
+            </div>
+
+            <div id="proxy-help" class="muted helper-text proxy-help hidden">
+              Экспериментальный режим подходит не для всех сайтов. Иногда видео и звук могут скачаться двумя отдельными файлами: один файл содержит изображение, второй — звук. Если так произошло, используй обычный режим скачивания — сервис сам объединит видео и звук в один файл.
             </div>
 
             <div>
@@ -115,14 +132,11 @@
               <div id="task-progress" class="progress-bar is-active"></div>
             </div>
 
-            <div id="task-result" class="hidden result-box">
-              <a
-                id="task-download-link"
-                class="primary-btn"
-                href="#"
-                target="_blank"
-                rel="noopener"
-              >
+            <div id="task-result" class="hidden result-box result-actions">
+              <a id="task-watch-link" class="secondary-btn" href="#" target="_blank" rel="noopener">
+                Просмотреть видео
+              </a>
+              <a id="task-download-link" class="primary-btn" href="#" target="_blank" rel="noopener">
                 Скачать готовый файл
               </a>
             </div>
@@ -155,7 +169,10 @@
 
                   <div class="history-side history-side-stack">
                     {% if item.status == 'done' and item.download_url and item.file_exists %}
-                      <a class="ghost-btn small-btn" href="{{ item.download_url }}" target="_blank" rel="noopener">Файл</a>
+                      {% if item.watch_url %}
+                        <a class="ghost-btn small-btn" href="{{ item.watch_url }}" target="_blank" rel="noopener">Просмотреть</a>
+                      {% endif %}
+                      <a class="ghost-btn small-btn" href="{{ item.download_url }}" target="_blank" rel="noopener">Скачать</a>
                     {% elif item.status == 'done' and item.download_url and not item.file_exists %}
                       <span class="status-inline status-missing">Файл удалён</span>
                     {% else %}
@@ -201,6 +218,13 @@
             {% endif %}
           </p>
 
+          <div class="cookies-hint muted">
+            Cookies нужны для сайтов, где видео доступно только после входа в аккаунт или без cookies скачивание завершается ошибкой.
+            Чтобы подготовить файл cookies.txt, установите расширение
+            <a href="https://github.com/kairi003/Get-cookies.txt-LOCALLY/" target="_blank" rel="noopener">Get cookies.txt LOCALLY</a>,
+            откройте нужный видеосайт в браузере, нажмите на иконку расширения и сохраните cookies в формате Netscape.
+          </div>
+
           <form id="cookies-form" class="stack-12 cookies-form-block">
             <input
               id="cookie-file"
@@ -245,6 +269,18 @@
               <div class="stat-box">
                 <div class="stat-label">Активные скачивания</div>
                 <div id="stat-active-tasks" class="stat-value">—</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Активные файлы</div>
+                <div id="stat-active-files" class="stat-value">—</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Занято загрузками</div>
+                <div id="stat-download-usage" class="stat-value">—</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Свободно на диске</div>
+                <div id="stat-disk-free" class="stat-value">—</div>
               </div>
               <div class="stat-box stat-box-accent">
                 <div class="stat-label">Сейчас можно перезапускать</div>
@@ -323,6 +359,11 @@
               {% endif %}
             </p>
 
+            <div class="cookies-hint muted">
+              Общий cookies.txt тоже должен быть сохранён в формате Netscape. Удобный вариант — расширение
+              <a href="https://github.com/kairi003/Get-cookies.txt-LOCALLY/" target="_blank" rel="noopener">Get cookies.txt LOCALLY</a>.
+            </div>
+
             <form id="admin-cookies-form" class="stack-12 cookies-form-block">
               <input
                 id="admin-cookie-file"
@@ -345,6 +386,62 @@
 
     {% if user.get("is_admin", False) %}
       <section class="admin-bottom-section">
+        <section class="card section-card admin-card admin-wide-card">
+          <details class="admin-details" open>
+            <summary>Хранение, лимиты и качество</summary>
+            <form id="admin-settings-form" class="settings-grid">
+              <label>Хранить файлы, минут <input name="download_retention_minutes" id="setting-download-retention" class="text-input" type="number" min="1"></label>
+              <label>Продлевать при просмотре, минут <input name="watch_extend_minutes" id="setting-watch-extend" class="text-input" type="number" min="1"></label>
+              <label>Макс. размер файла, ГБ <input name="max_single_file_gb" id="setting-max-file-gb" class="text-input" type="text" inputmode="decimal"></label>
+              <label>Квота каталога загрузок, ГБ <input name="max_download_dir_gb" id="setting-max-dir-gb" class="text-input" type="text" inputmode="decimal"></label>
+              <label>Минимум свободно на диске, ГБ <input name="min_free_disk_gb" id="setting-min-free-gb" class="text-input" type="text" inputmode="decimal"></label>
+              <label>Макс. качество
+                <select name="max_video_height" id="setting-max-video-height" class="text-input">
+                  <option value="720">720p</option>
+                  <option value="1080">1080p</option>
+                  <option value="1440">1440p</option>
+                  <option value="2160">4K / 2160p</option>
+                  <option value="0">Без ограничения</option>
+                </select>
+              </label>
+              <label>Качество по умолчанию
+                <select name="default_user_quality" id="setting-default-quality" class="text-input">
+                  <option value="720">720p</option>
+                  <option value="1080">1080p</option>
+                  <option value="1440">1440p</option>
+                  <option value="2160">4K / 2160p</option>
+                </select>
+              </label>
+
+              <label class="check-row"><input name="extend_expiry_on_watch" id="setting-extend-watch" type="checkbox"> Продлевать срок при открытии просмотра</label>
+              <label class="check-row"><input name="user_quality_selection_enabled" id="setting-user-quality" type="checkbox"> Пользователь выбирает качество</label>
+              <label class="check-row"><input name="allow_unlimited_file_size" id="setting-unlimited-file" type="checkbox"> Не ограничивать размер одного файла</label>
+              <label class="check-row"><input name="allow_unlimited_download_dir" id="setting-unlimited-dir" type="checkbox"> Не ограничивать квоту каталога</label>
+              <label class="check-row"><input name="allow_unlimited_quality" id="setting-unlimited-quality" type="checkbox"> Не ограничивать качество</label>
+              <label class="check-row"><input name="experimental_proxy_download_enabled" id="setting-proxy-enabled" type="checkbox"> Включить экспериментальное скачивание без хранения</label>
+
+              <label>Эксп. лимит файла, ГБ <input name="experimental_proxy_max_file_gb" id="setting-proxy-max-gb" class="text-input" type="text" inputmode="decimal"></label>
+              <label>Эксп. лимит времени, минут <input name="experimental_proxy_max_duration_minutes" id="setting-proxy-minutes" class="text-input" type="number" min="1"></label>
+
+              <div class="settings-actions">
+                <button class="primary-btn" type="submit">Сохранить настройки</button>
+              </div>
+            </form>
+          </details>
+        </section>
+
+        <section class="card section-card admin-card admin-wide-card">
+          <details class="admin-details" open>
+            <summary>Загруженные файлы и автоудаление</summary>
+            <div class="admin-file-actions">
+              <button id="admin-cleanup-expired-btn" class="ghost-btn small-btn" type="button">Очистить просроченные</button>
+              <button id="admin-cleanup-all-files-btn" class="ghost-btn small-btn danger-btn" type="button">Очистить все загруженные файлы</button>
+            </div>
+            <div id="admin-files-empty" class="empty-state hidden">Активных загруженных файлов нет.</div>
+            <div id="admin-files-list" class="admin-files-list"></div>
+          </details>
+        </section>
+
         <section class="card section-card admin-card admin-wide-card">
           <div class="section-head">
             <div>

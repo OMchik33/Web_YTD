@@ -14,13 +14,15 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
+from decimal import Decimal, InvalidOperation
 
 import yt_dlp
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.background import BackgroundTask
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,8 +52,6 @@ WEB_COOKIE_SESSION = os.getenv("WEB_COOKIE_SESSION", "web_ytd_session")
 WEB_UID_MAX_AGE = int(os.getenv("WEB_UID_MAX_AGE", str(180 * 24 * 3600)))
 WEB_SESSION_MAX_AGE = int(os.getenv("WEB_SESSION_MAX_AGE", str(7 * 24 * 3600)))
 USER_RETENTION_DAYS = int(os.getenv("USER_RETENTION_DAYS", "30"))
-CLEANUP_HOUR = int(os.getenv("CLEANUP_HOUR", "4"))
-CLEANUP_MINUTE = int(os.getenv("CLEANUP_MINUTE", "10"))
 MAX_ACTIVE_TASKS = max(1, int(os.getenv("MAX_ACTIVE_TASKS", "1")))
 MAX_ACTIVE_TASKS_PER_USER = max(1, int(os.getenv("MAX_ACTIVE_TASKS_PER_USER", "1")))
 REQUEST_TTL_HOURS = int(os.getenv("REQUEST_TTL_HOURS", "1"))
@@ -59,7 +59,6 @@ DOWNLOAD_PATH = resolve_path_env(os.getenv("DOWNLOAD_PATH", "/download"), Path("
 COOKIES_PATH = resolve_path_env(os.getenv("COOKIES_PATH", "cookies"), BASE_DIR / "cookies")
 DATA_PATH = resolve_path_env(os.getenv("DATA_PATH", "data"), BASE_DIR / "data")
 LOG_PATH = resolve_path_env(os.getenv("LOG_PATH", "logs"), BASE_DIR / "logs")
-DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", "https://example.com/files")
 PUBLIC_BASE_URL = os.getenv("WEB_PUBLIC_BASE_URL", os.getenv("PUBLIC_BASE_URL", "")).rstrip("/")
 DEBUG_YTDLP = os.getenv("DEBUG_YTDLP", "0") == "1"
 SQLITE_DB_NAME = os.getenv("SQLITE_DB_NAME", "web_ytd.sqlite3")
@@ -160,6 +159,33 @@ CREATE TABLE IF NOT EXISTS download_history (
   FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS downloaded_files (
+  file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  history_id INTEGER,
+  public_token TEXT NOT NULL UNIQUE,
+  source_url TEXT,
+  stored_filename TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  file_size INTEGER NOT NULL DEFAULT 0,
+  mime_type TEXT,
+  quality_label TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_accessed_at TEXT,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
+  delete_reason TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+  FOREIGN KEY (history_id) REFERENCES download_history(id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_users_last_seen_at ON users(last_seen_at);
@@ -168,6 +194,10 @@ CREATE INDEX IF NOT EXISTS idx_users_invite_id ON users(invite_id);
 CREATE INDEX IF NOT EXISTS idx_history_user_created_at ON download_history(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_invite_links_activated_at ON invite_links(activated_at);
 CREATE INDEX IF NOT EXISTS idx_invite_links_revoked_at ON invite_links(revoked_at);
+CREATE INDEX IF NOT EXISTS idx_files_user_created_at ON downloaded_files(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_files_token ON downloaded_files(public_token);
+CREATE INDEX IF NOT EXISTS idx_files_expires_at ON downloaded_files(expires_at);
+CREATE INDEX IF NOT EXISTS idx_files_deleted_at ON downloaded_files(deleted_at);
 """
 
 
@@ -276,6 +306,188 @@ async def db_execute(query: str, params: tuple[Any, ...] = ()) -> int:
 async def db_execute_insert(query: str, params: tuple[Any, ...] = ()) -> int:
     async with db_write_lock:
         return await asyncio.to_thread(_db_execute_insert, query, params)
+
+
+DEFAULT_SETTINGS: dict[str, str] = {
+    "download_retention_minutes": "60",
+    "watch_extend_minutes": "240",
+    "extend_expiry_on_watch": "1",
+    "max_single_file_gb": "4",
+    "max_download_dir_gb": "18",
+    "min_free_disk_gb": "5",
+    "max_video_height": "1080",
+    "allow_unlimited_file_size": "0",
+    "allow_unlimited_download_dir": "0",
+    "allow_unlimited_quality": "0",
+    "user_quality_selection_enabled": "1",
+    "default_user_quality": "1080",
+    "experimental_proxy_download_enabled": "0",
+    "experimental_proxy_max_file_gb": "2",
+    "experimental_proxy_max_duration_minutes": "30",
+}
+
+QUALITY_HEIGHTS = [720, 1080, 1440, 2160]
+
+
+def parse_decimal_setting(value: Any, default: Decimal) -> Decimal:
+    raw = str(value if value is not None else "").strip().replace(",", ".")
+    if not raw:
+        return default
+    try:
+        parsed = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
+def setting_bool(settings: dict[str, str], key: str) -> bool:
+    return str(settings.get(key, DEFAULT_SETTINGS.get(key, "0"))).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def setting_int(settings: dict[str, str], key: str, default: int) -> int:
+    try:
+        return int(str(settings.get(key, str(default))).strip())
+    except Exception:
+        return default
+
+
+def setting_gb_to_bytes(settings: dict[str, str], key: str, default_gb: Decimal) -> int:
+    value = parse_decimal_setting(settings.get(key), default_gb)
+    return int(value * Decimal(1024 ** 3))
+
+
+def _ensure_default_settings_sync() -> None:
+    now_iso = iso(now_utc())
+    with db_connect() as conn:
+        for key, value in DEFAULT_SETTINGS.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, now_iso),
+            )
+        conn.commit()
+
+
+async def ensure_default_settings() -> None:
+    async with db_write_lock:
+        await asyncio.to_thread(_ensure_default_settings_sync)
+
+
+def _get_settings_sync() -> dict[str, str]:
+    _ensure_default_settings_sync()
+    with db_connect() as conn:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update({row["key"]: row["value"] for row in rows})
+    return settings
+
+
+async def get_settings() -> dict[str, str]:
+    return await asyncio.to_thread(_get_settings_sync)
+
+
+def normalize_quality_height(value: Any, *, allow_unlimited: bool) -> int:
+    raw = str(value if value is not None else "").strip().lower()
+    if allow_unlimited and raw in {"0", "none", "unlimited", "без ограничения"}:
+        return 0
+    try:
+        height = int(raw)
+    except Exception:
+        return int(DEFAULT_SETTINGS["max_video_height"])
+    if height <= 0:
+        return 0 if allow_unlimited else int(DEFAULT_SETTINGS["max_video_height"])
+    return height
+
+
+def normalize_gb_input(value: Any, default_value: str) -> str:
+    parsed = parse_decimal_setting(value, Decimal(default_value.replace(",", ".")))
+    if parsed <= 0:
+        parsed = Decimal(default_value.replace(",", "."))
+    normalized = format(parsed.normalize(), "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or default_value
+
+
+async def update_settings_from_form(form: dict[str, Any]) -> dict[str, str]:
+    current = await get_settings()
+    allowed_quality_values = {0, 720, 1080, 1440, 2160}
+
+    next_values = {
+        "download_retention_minutes": str(max(1, setting_int(form, "download_retention_minutes", setting_int(current, "download_retention_minutes", 60)))),
+        "watch_extend_minutes": str(max(1, setting_int(form, "watch_extend_minutes", setting_int(current, "watch_extend_minutes", 240)))),
+        "extend_expiry_on_watch": "1" if str(form.get("extend_expiry_on_watch", "")).lower() in {"1", "true", "on", "yes"} else "0",
+        "max_single_file_gb": normalize_gb_input(form.get("max_single_file_gb"), current.get("max_single_file_gb", DEFAULT_SETTINGS["max_single_file_gb"])),
+        "max_download_dir_gb": normalize_gb_input(form.get("max_download_dir_gb"), current.get("max_download_dir_gb", DEFAULT_SETTINGS["max_download_dir_gb"])),
+        "min_free_disk_gb": normalize_gb_input(form.get("min_free_disk_gb"), current.get("min_free_disk_gb", DEFAULT_SETTINGS["min_free_disk_gb"])),
+        "allow_unlimited_file_size": "1" if str(form.get("allow_unlimited_file_size", "")).lower() in {"1", "true", "on", "yes"} else "0",
+        "allow_unlimited_download_dir": "1" if str(form.get("allow_unlimited_download_dir", "")).lower() in {"1", "true", "on", "yes"} else "0",
+        "allow_unlimited_quality": "1" if str(form.get("allow_unlimited_quality", "")).lower() in {"1", "true", "on", "yes"} else "0",
+        "user_quality_selection_enabled": "1" if str(form.get("user_quality_selection_enabled", "")).lower() in {"1", "true", "on", "yes"} else "0",
+        "default_user_quality": str(normalize_quality_height(form.get("default_user_quality"), allow_unlimited=True)),
+        "experimental_proxy_download_enabled": "1" if str(form.get("experimental_proxy_download_enabled", "")).lower() in {"1", "true", "on", "yes"} else "0",
+        "experimental_proxy_max_file_gb": normalize_gb_input(form.get("experimental_proxy_max_file_gb"), current.get("experimental_proxy_max_file_gb", DEFAULT_SETTINGS["experimental_proxy_max_file_gb"])),
+        "experimental_proxy_max_duration_minutes": str(max(1, setting_int(form, "experimental_proxy_max_duration_minutes", setting_int(current, "experimental_proxy_max_duration_minutes", 30)))),
+    }
+
+    max_video_height = normalize_quality_height(form.get("max_video_height"), allow_unlimited=True)
+    if max_video_height not in allowed_quality_values:
+        max_video_height = setting_int(current, "max_video_height", 1080)
+    next_values["max_video_height"] = str(max_video_height)
+
+    if int(next_values["default_user_quality"]) not in allowed_quality_values:
+        next_values["default_user_quality"] = current.get("default_user_quality", DEFAULT_SETTINGS["default_user_quality"])
+
+    now_iso = iso(now_utc())
+    async with db_write_lock:
+        def _save() -> None:
+            with db_connect() as conn:
+                for key, value in next_values.items():
+                    conn.execute(
+                        """
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                        """,
+                        (key, value, now_iso),
+                    )
+                conn.commit()
+        await asyncio.to_thread(_save)
+
+    return await get_settings()
+
+
+def settings_public_view(settings: dict[str, str]) -> dict[str, Any]:
+    max_height = setting_int(settings, "max_video_height", 1080)
+    default_quality = setting_int(settings, "default_user_quality", 1080)
+    if max_height and default_quality > max_height:
+        default_quality = max_height
+    return {
+        **settings,
+        "download_retention_minutes": setting_int(settings, "download_retention_minutes", 60),
+        "watch_extend_minutes": setting_int(settings, "watch_extend_minutes", 240),
+        "extend_expiry_on_watch": setting_bool(settings, "extend_expiry_on_watch"),
+        "max_single_file_gb": settings.get("max_single_file_gb", "4"),
+        "max_download_dir_gb": settings.get("max_download_dir_gb", "18"),
+        "min_free_disk_gb": settings.get("min_free_disk_gb", "5"),
+        "max_video_height": max_height,
+        "allow_unlimited_file_size": setting_bool(settings, "allow_unlimited_file_size"),
+        "allow_unlimited_download_dir": setting_bool(settings, "allow_unlimited_download_dir"),
+        "allow_unlimited_quality": setting_bool(settings, "allow_unlimited_quality"),
+        "user_quality_selection_enabled": setting_bool(settings, "user_quality_selection_enabled"),
+        "default_user_quality": default_quality,
+        "experimental_proxy_download_enabled": setting_bool(settings, "experimental_proxy_download_enabled"),
+        "experimental_proxy_max_file_gb": settings.get("experimental_proxy_max_file_gb", "2"),
+        "experimental_proxy_max_duration_minutes": setting_int(settings, "experimental_proxy_max_duration_minutes", 30),
+    }
+
+
+def allowed_quality_options(settings: dict[str, str]) -> list[int]:
+    if setting_bool(settings, "allow_unlimited_quality") or setting_int(settings, "max_video_height", 1080) == 0:
+        return QUALITY_HEIGHTS[:]
+    max_height = setting_int(settings, "max_video_height", 1080)
+    return [height for height in QUALITY_HEIGHTS if height <= max_height]
 
 
 def _rename_to_backup(path: Path) -> None:
@@ -540,8 +752,8 @@ async def get_or_create_browser_user_id(request: Request, *, is_admin: bool = Fa
     return user_id, True
 
 
-async def append_history(user_id: str, record: dict[str, Any]) -> None:
-    await db_execute(
+async def append_history(user_id: str, record: dict[str, Any]) -> int:
+    return await db_execute_insert(
         """
         INSERT INTO download_history (
           user_id, created_at, title, mode, status, error, source_url, download_url, filename
@@ -559,7 +771,6 @@ async def append_history(user_id: str, record: dict[str, Any]) -> None:
             record.get("filename"),
         ),
     )
-
 
 async def get_history(user_id: str) -> list[dict[str, Any]]:
     return await db_fetchall(
@@ -804,6 +1015,250 @@ def fmt_eta(seconds: float | int | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def guess_mime_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".mp4":
+        return "video/mp4"
+    if ext == ".webm":
+        return "video/webm"
+    if ext == ".mkv":
+        return "video/x-matroska"
+    if ext == ".mp3":
+        return "audio/mpeg"
+    if ext == ".m4a":
+        return "audio/mp4"
+    if ext == ".jpg" or ext == ".jpeg":
+        return "image/jpeg"
+    if ext == ".png":
+        return "image/png"
+    return "application/octet-stream"
+
+
+def get_download_dir_usage_bytes() -> int:
+    total = 0
+    for path in DOWNLOAD_PATH.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            continue
+    return total
+
+
+def get_disk_stats() -> dict[str, Any]:
+    usage = shutil.disk_usage(DOWNLOAD_PATH)
+    download_usage = get_download_dir_usage_bytes()
+    return {
+        "disk_total": usage.total,
+        "disk_used": usage.used,
+        "disk_free": usage.free,
+        "download_usage": download_usage,
+        "disk_total_text": fmt_size(usage.total),
+        "disk_used_text": fmt_size(usage.used),
+        "disk_free_text": fmt_size(usage.free),
+        "download_usage_text": fmt_size(download_usage),
+    }
+
+
+async def enforce_storage_limits(settings: dict[str, str]) -> None:
+    stats = await asyncio.to_thread(get_disk_stats)
+    if stats["disk_free"] < setting_gb_to_bytes(settings, "min_free_disk_gb", Decimal("5")):
+        raise HTTPException(status_code=507, detail="Недостаточно свободного места на сервере. Попробуйте позже.")
+
+    if not setting_bool(settings, "allow_unlimited_download_dir"):
+        max_dir = setting_gb_to_bytes(settings, "max_download_dir_gb", Decimal("18"))
+        if stats["download_usage"] >= max_dir:
+            raise HTTPException(status_code=507, detail="Квота каталога загрузок исчерпана. Попробуйте позже.")
+
+
+def build_quality_label(mode: str, format_id: str | None, requested_height: int | None = None) -> str:
+    if mode == "audio":
+        return "MP3"
+    if requested_height:
+        return f"{requested_height}p"
+    if mode == "safe":
+        return "MP4"
+    if mode == "bestq":
+        return "Лучшее"
+    if mode == "any":
+        return "Любой"
+    if mode == "pick":
+        return f"Формат {format_id}" if format_id else "Выбранный формат"
+    return mode
+
+
+async def register_downloaded_file(
+    *,
+    user_id: str,
+    source_url: str,
+    stored_filename: str,
+    file_path: Path,
+    quality_label: str | None,
+) -> dict[str, Any]:
+    settings = await get_settings()
+    created = now_utc()
+    expires = created + dt.timedelta(minutes=setting_int(settings, "download_retention_minutes", 60))
+    token = secrets.token_urlsafe(24)
+    size = file_path.stat().st_size if file_path.exists() else 0
+    mime_type = guess_mime_type(file_path)
+
+    file_id = await db_execute_insert(
+        """
+        INSERT INTO downloaded_files (
+          user_id, public_token, source_url, stored_filename, file_path, file_size,
+          mime_type, quality_label, created_at, expires_at, last_accessed_at,
+          access_count, deleted_at, delete_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
+        """,
+        (
+            user_id,
+            token,
+            source_url,
+            stored_filename,
+            str(file_path),
+            size,
+            mime_type,
+            quality_label,
+            iso(created),
+            iso(expires),
+        ),
+    )
+
+    row = await db_fetchone("SELECT * FROM downloaded_files WHERE file_id = ?", (file_id,))
+    if not row:
+        raise RuntimeError("Не удалось зарегистрировать скачанный файл")
+    return row
+
+
+async def get_file_by_token(token: str) -> dict[str, Any] | None:
+    return await db_fetchone("SELECT * FROM downloaded_files WHERE public_token = ?", (token,))
+
+
+def file_public_links(request: Request, token: str) -> dict[str, str]:
+    return {
+        "download_url": build_public_url(request, f"/media/download/{quote(token)}"),
+        "watch_url": build_public_url(request, f"/media/watch/{quote(token)}"),
+    }
+
+
+async def mark_file_accessed(file_id: int) -> None:
+    settings = await get_settings()
+    now = now_utc()
+    expires = None
+    if setting_bool(settings, "extend_expiry_on_watch"):
+        expires = iso(now + dt.timedelta(minutes=setting_int(settings, "watch_extend_minutes", 240)))
+
+    if expires:
+        await db_execute(
+            """
+            UPDATE downloaded_files
+            SET last_accessed_at = ?, access_count = access_count + 1, expires_at = ?
+            WHERE file_id = ?
+            """,
+            (iso(now), expires, file_id),
+        )
+    else:
+        await db_execute(
+            "UPDATE downloaded_files SET last_accessed_at = ?, access_count = access_count + 1 WHERE file_id = ?",
+            (iso(now), file_id),
+        )
+
+
+async def delete_downloaded_file(file_id: int, reason: str) -> bool:
+    row = await db_fetchone("SELECT * FROM downloaded_files WHERE file_id = ?", (file_id,))
+    if not row or row.get("deleted_at"):
+        return False
+    path = Path(row["file_path"])
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except Exception:
+        logger.exception("Failed to delete downloaded file file_id=%s path=%s", file_id, path)
+        raise
+    await db_execute(
+        "UPDATE downloaded_files SET deleted_at = ?, delete_reason = ? WHERE file_id = ?",
+        (iso(now_utc()), reason, file_id),
+    )
+    return True
+
+
+async def cleanup_expired_downloaded_files() -> int:
+    rows = await db_fetchall(
+        """
+        SELECT file_id
+        FROM downloaded_files
+        WHERE deleted_at IS NULL
+          AND expires_at <= ?
+        """,
+        (iso(now_utc()),),
+    )
+    removed = 0
+    for row in rows:
+        try:
+            if await delete_downloaded_file(int(row["file_id"]), "expired"):
+                removed += 1
+        except Exception:
+            logger.exception("Failed to cleanup expired downloaded file_id=%s", row.get("file_id"))
+    return removed
+
+
+async def cleanup_missing_downloaded_files() -> int:
+    rows = await db_fetchall("SELECT file_id, file_path FROM downloaded_files WHERE deleted_at IS NULL")
+    marked = 0
+    for row in rows:
+        path = Path(row["file_path"])
+        if not path.exists():
+            await db_execute(
+                "UPDATE downloaded_files SET deleted_at = ?, delete_reason = ? WHERE file_id = ?",
+                (iso(now_utc()), "missing_on_disk", row["file_id"]),
+            )
+            marked += 1
+    return marked
+
+
+async def cleanup_stale_temp_files(max_age_minutes: int = 180) -> int:
+    cutoff = time.time() - max_age_minutes * 60
+    removed = 0
+    for path in DOWNLOAD_PATH.glob("webtmp_*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            logger.exception("Failed to delete stale temp file %s", path)
+    return removed
+
+
+async def list_active_downloaded_files(request: Request | None = None) -> list[dict[str, Any]]:
+    rows = await db_fetchall(
+        """
+        SELECT
+          f.file_id, f.user_id, f.public_token, f.stored_filename, f.file_size,
+          f.mime_type, f.quality_label, f.created_at, f.expires_at, f.last_accessed_at,
+          f.access_count, i.label AS access_label
+        FROM downloaded_files f
+        LEFT JOIN users u ON u.user_id = f.user_id
+        LEFT JOIN invite_links i ON i.invite_id = u.invite_id
+        WHERE f.deleted_at IS NULL
+        ORDER BY f.created_at DESC, f.file_id DESC
+        """
+    )
+    now = now_utc()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        expires = from_iso(row.get("expires_at"))
+        left_seconds = max(0, int((expires - now).total_seconds())) if expires else 0
+        item = dict(row)
+        item["file_size_text"] = fmt_size(item.get("file_size"))
+        item["time_left_seconds"] = left_seconds
+        item["time_left_text"] = fmt_eta(left_seconds)
+        item["user_label"] = item.get("access_label") or item.get("user_id")
+        if request is not None:
+            item.update(file_public_links(request, item["public_token"]))
+        result.append(item)
+    return result
+
+
 def build_base_ydl_opts(user_id: str, *, skip_download: bool, quiet: bool, task_id: str | None = None) -> dict[str, Any]:
     user_cookie = get_cookie_file(user_id)
     cookie_file = user_cookie or get_admin_cookie_file()
@@ -855,16 +1310,17 @@ def build_base_ydl_opts(user_id: str, *, skip_download: bool, quiet: bool, task_
     return opts
 
 
-def get_format_string(mode: str, format_id: str | None) -> str:
+def get_format_string(mode: str, format_id: str | None, max_height: int = 0) -> str:
+    height_filter = f"[height<={max_height}]" if max_height and max_height > 0 else ""
     if mode == "pick":
         return f"{format_id}+bestaudio[ext=m4a]/best[ext=mp4]/best"
     if mode == "safe":
-        return "best[ext=mp4]/best"
+        return f"best[ext=mp4]{height_filter}/best{height_filter}/best"
     if mode == "bestq":
-        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        return f"bestvideo{height_filter}[ext=mp4]+bestaudio[ext=m4a]/best{height_filter}[ext=mp4]/best{height_filter}/best"
     if mode == "any":
-        return "best"
-    return "best"
+        return f"best{height_filter}/best"
+    return f"best{height_filter}/best"
 
 
 def ydl_extract(url: str, opts: dict[str, Any], *, download: bool):
@@ -936,6 +1392,9 @@ async def analyze_url_for_user(user_id: str, url: str) -> dict[str, Any]:
 
 def sync_analyze_url(user_id: str, url: str) -> dict[str, Any]:
     url = clean_youtube_url(url.strip())
+    settings = _get_settings_sync()
+    max_height = setting_int(settings, "max_video_height", 1080)
+    allow_unlimited_quality = setting_bool(settings, "allow_unlimited_quality") or max_height == 0
     opts_info = build_base_ydl_opts(user_id, skip_download=True, quiet=True)
     info = ydl_extract(url, opts_info, download=False)
 
@@ -966,6 +1425,8 @@ def sync_analyze_url(user_id: str, url: str) -> dict[str, Any]:
 
         if not height:
             continue
+        if not allow_unlimited_quality and height > max_height:
+            continue
 
         size = f.get("filesize") or f.get("filesize_approx") or 0
         label = f"{height}p {ext}"
@@ -993,6 +1454,11 @@ def sync_analyze_url(user_id: str, url: str) -> dict[str, Any]:
         "url": url,
         "thumbnail_url": thumbnail_url,
         "formats": available,
+        "settings": {
+            "quality_options": allowed_quality_options(settings),
+            "default_user_quality": setting_int(settings, "default_user_quality", 1080),
+            "experimental_proxy_download_enabled": setting_bool(settings, "experimental_proxy_download_enabled"),
+        },
     }
 
 
@@ -1085,6 +1551,7 @@ async def start_download_task(
     mode: str,
     format_id: str | None = None,
     title_hint: str | None = None,
+    requested_height: int | None = None,
 ) -> dict[str, Any]:
     if await count_user_active_tasks(user_id) >= MAX_ACTIVE_TASKS_PER_USER:
         raise HTTPException(status_code=429, detail="У вас уже есть активная задача. Дождитесь завершения.")
@@ -1093,6 +1560,10 @@ async def start_download_task(
     task["mode"] = mode
     task["title"] = title_hint
     task["format_id"] = format_id
+    task["requested_height"] = requested_height
+
+    settings = await get_settings()
+    await enforce_storage_limits(settings)
 
     position = await add_to_queue(task["task_id"])
     await update_task(
@@ -1113,8 +1584,19 @@ def sync_download_media(
     mode: str,
     format_id: str | None,
     title_hint: str | None,
+    requested_height: int | None,
 ) -> dict[str, Any]:
     opts = build_base_ydl_opts(user_id, skip_download=False, quiet=False, task_id=task_id)
+    settings = _get_settings_sync()
+    if not setting_bool(settings, "allow_unlimited_file_size"):
+        opts["max_filesize"] = setting_gb_to_bytes(settings, "max_single_file_gb", Decimal("4"))
+    max_height = setting_int(settings, "max_video_height", 1080)
+    if setting_bool(settings, "allow_unlimited_quality"):
+        max_height = 0
+    if requested_height:
+        if max_height and requested_height > max_height:
+            requested_height = max_height
+        max_height = requested_height
     title = title_hint or "Видео"
     last_progress_emit = 0.0
 
@@ -1212,7 +1694,7 @@ def sync_download_media(
     else:
         if mode == "pick" and not format_id:
             raise RuntimeError("Не передан format_id.")
-        opts["format"] = get_format_string(mode, format_id)
+        opts["format"] = get_format_string(mode, format_id, max_height=max_height)
 
     logger.info("Downloading url=%s mode=%s format=%s", url, mode, opts.get("format"))
 
@@ -1242,12 +1724,12 @@ def sync_download_media(
     final = DOWNLOAD_PATH / unique
     os.replace(path, final)
 
-    clean_title = sanitize_filename(title)
-    dlink = f"{DOWNLOAD_BASE_URL}/{quote(unique)}?filename={quote(clean_title + '.' + ext)}"
     return {
         "title": title,
         "filename": final.name,
-        "download_url": dlink,
+        "file_path": str(final),
+        "file_size": final.stat().st_size,
+        "quality_label": build_quality_label(mode, format_id, requested_height),
         "thumbnail_url": thumbnail_url,
     }
 
@@ -1282,6 +1764,7 @@ async def download_worker(worker_index: int) -> None:
             mode = task["mode"]
             format_id = task.get("format_id")
             title_hint = task.get("title")
+            requested_height = task.get("requested_height")
 
             loop = asyncio.get_running_loop()
 
@@ -1295,16 +1778,29 @@ async def download_worker(worker_index: int) -> None:
                 mode,
                 format_id,
                 title_hint,
+                requested_height,
             )
+
+            file_row = await register_downloaded_file(
+                user_id=user_id,
+                source_url=url,
+                stored_filename=result["filename"],
+                file_path=Path(result["file_path"]),
+                quality_label=result.get("quality_label"),
+            )
+            media_download_url = f"{WEB_BASE_PATH}/media/download/{quote(file_row['public_token'])}"
+            media_watch_url = f"{WEB_BASE_PATH}/media/watch/{quote(file_row['public_token'])}"
 
             await update_task(
                 task_id,
                 status="done",
                 status_label="Готово",
-                detail="Файл готов к скачиванию",
+                detail="Файл готов к скачиванию и просмотру",
                 title=result["title"],
                 filename=result["filename"],
-                download_url=result["download_url"],
+                file_id=file_row["file_id"],
+                download_url=media_download_url,
+                watch_url=media_watch_url,
                 thumbnail_url=result.get("thumbnail_url"),
                 error=None,
                 done=True,
@@ -1312,17 +1808,21 @@ async def download_worker(worker_index: int) -> None:
             )
 
             await update_last_download_at(user_id)
-            await append_history(
+            history_id = await append_history(
                 user_id,
                 {
                     "created_at": iso(now_utc()),
                     "title": result["title"],
                     "mode": mode,
                     "status": "done",
-                    "download_url": result["download_url"],
+                    "download_url": media_download_url,
                     "filename": result["filename"],
                     "source_url": url,
                 },
+            )
+            await db_execute(
+                "UPDATE downloaded_files SET history_id = ? WHERE file_id = ?",
+                (history_id, file_row["file_id"]),
             )
 
         except Exception as exc:
@@ -1398,6 +1898,9 @@ async def perform_cleanup() -> dict[str, int]:
     removed_universal_users = 0
     removed_revoked_invites = 0
     removed_finished_tasks = 0
+    removed_expired_files = 0
+    marked_missing_files = 0
+    removed_stale_temp_files = 0
 
     expired_sessions = await db_fetchall(
         "SELECT session_id FROM sessions WHERE expires_at IS NULL OR expires_at <= ?",
@@ -1450,13 +1953,19 @@ async def perform_cleanup() -> dict[str, int]:
         removed_universal_users += 1
 
     removed_finished_tasks = await purge_old_finished_tasks()
+    removed_expired_files = await cleanup_expired_downloaded_files()
+    marked_missing_files = await cleanup_missing_downloaded_files()
+    removed_stale_temp_files = await cleanup_stale_temp_files()
 
     logger.info(
-        "Cleanup finished: removed_universal_users=%s removed_revoked_invites=%s removed_sessions=%s removed_finished_tasks=%s",
+        "Cleanup finished: removed_universal_users=%s removed_revoked_invites=%s removed_sessions=%s removed_finished_tasks=%s removed_expired_files=%s marked_missing_files=%s removed_stale_temp_files=%s",
         removed_universal_users,
         removed_revoked_invites,
         removed_sessions,
         removed_finished_tasks,
+        removed_expired_files,
+        marked_missing_files,
+        removed_stale_temp_files,
     )
 
     return {
@@ -1464,24 +1973,20 @@ async def perform_cleanup() -> dict[str, int]:
         "removed_revoked_invites": removed_revoked_invites,
         "removed_sessions": removed_sessions,
         "removed_finished_tasks": removed_finished_tasks,
+        "removed_expired_files": removed_expired_files,
+        "marked_missing_files": marked_missing_files,
+        "removed_stale_temp_files": removed_stale_temp_files,
     }
 
 
 async def cleanup_scheduler() -> None:
     await asyncio.sleep(2)
     while True:
-        now = now_utc()
-        next_run = now.astimezone().replace(hour=CLEANUP_HOUR, minute=CLEANUP_MINUTE, second=0, microsecond=0)
-        if next_run <= now.astimezone():
-            next_run = next_run + dt.timedelta(days=1)
-        sleep_seconds = max(30, (next_run.astimezone(dt.timezone.utc) - now).total_seconds())
-        logger.info("Next cleanup at %s", next_run.isoformat())
-        await asyncio.sleep(sleep_seconds)
         try:
             await perform_cleanup()
         except Exception:
             logger.exception("Scheduled cleanup failed")
-
+        await asyncio.sleep(60)
 
 def build_public_url(request: Request, path: str) -> str:
     base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
@@ -1687,21 +2192,30 @@ async def get_admin_overview(request: Request) -> dict[str, Any]:
                 "user_id": task.get("user_id"),
                 "user_label": user_label or task.get("user_id"),
                 "status_label": task.get("status_label"),
-                "title": task.get("title") or "Видео",
+                "title": f"Задача {task.get('task_id')}",
+                "filename": task.get("filename") or "",
+                "quality_label": build_quality_label(task.get("mode") or "", task.get("format_id"), task.get("requested_height")),
                 "detail": task.get("detail"),
                 "updated_at": task.get("updated_at"),
             }
         )
 
     safe_to_restart = len(active_task_rows) == 0 and int((users_5 or {}).get("cnt", 0)) == 0
+    settings = await get_settings()
+    disk_stats = await asyncio.to_thread(get_disk_stats)
+    files = await list_active_downloaded_files(request)
 
     return {
         "generated_at": iso(now),
+        "settings": settings_public_view(settings),
+        "disk": disk_stats,
+        "files": files,
         "stats": {
             "active_last_5m": int((users_5 or {}).get("cnt", 0)),
             "active_last_10m": int((users_10 or {}).get("cnt", 0)),
             "active_tasks": len(active_task_rows),
             "active_task_users": len(active_user_ids),
+            "active_files": len(files),
             "safe_to_restart": safe_to_restart,
         },
         "links": {
@@ -1715,6 +2229,7 @@ async def get_admin_overview(request: Request) -> dict[str, Any]:
 @app.on_event("startup")
 async def on_startup() -> None:
     await db_init()
+    await ensure_default_settings()
     await migrate_json_to_sqlite()
     await perform_cleanup()
     asyncio.create_task(cleanup_scheduler())
@@ -1860,13 +2375,17 @@ async def dashboard(request: Request):
     for item in history:
         row = dict(item)
         row["file_exists"] = False
+        row["watch_url"] = None
         download_url = row.get("download_url")
         if row.get("status") == "done" and download_url:
-            try:
-                stored_name = download_url.split("/files/", 1)[1].split("?", 1)[0]
-                row["file_exists"] = (DOWNLOAD_PATH / stored_name).exists()
-            except Exception:
-                row["file_exists"] = False
+            token = None
+            if "/media/download/" in download_url:
+                token = download_url.rsplit("/media/download/", 1)[1].split("?", 1)[0].strip("/")
+            if token:
+                file_row = await get_file_by_token(token)
+                if file_row and not file_row.get("deleted_at") and Path(file_row["file_path"]).exists():
+                    row["file_exists"] = True
+                    row["watch_url"] = f"{WEB_BASE_PATH}/media/watch/{quote(token)}"
         history_view.append(row)
 
     return templates.TemplateResponse(
@@ -1896,6 +2415,7 @@ async def api_me(request: Request):
         "last_seen_at": meta.get("last_seen_at"),
         "cookie_state": build_effective_cookie_state(user_id, meta),
         "admin_cookie_state": build_admin_cookie_state() if meta.get("is_admin") else None,
+        "settings": settings_public_view(await get_settings()),
     }
 
 
@@ -2048,6 +2568,7 @@ async def api_download(
     mode: str = Form(...),
     format_id: str | None = Form(None),
     title: str | None = Form(None),
+    quality_height: int | None = Form(None),
 ):
     user_id = await get_current_user_id(request)
     url = url.strip()
@@ -2055,7 +2576,7 @@ async def api_download(
         raise HTTPException(status_code=400, detail="Неизвестный режим скачивания.")
 
     await mark_user_seen(user_id, touch_activity=True)
-    task = await start_download_task(user_id, url, mode, format_id=format_id, title_hint=title)
+    task = await start_download_task(user_id, url, mode, format_id=format_id, title_hint=title, requested_height=quality_height)
     return {
         "ok": True,
         "task_id": task["task_id"],
@@ -2073,6 +2594,121 @@ async def api_task_status(request: Request, task_id: str):
     if not task or task.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Задача не найдена.")
     return task
+
+
+
+@web.get("/media/download/{token}")
+async def media_download(request: Request, token: str):
+    file_row = await get_file_by_token(token)
+    if not file_row or file_row.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="Файл уже удалён или ссылка недействительна.")
+    expires_at = from_iso(file_row.get("expires_at"))
+    if expires_at and expires_at <= now_utc():
+        await delete_downloaded_file(int(file_row["file_id"]), "expired")
+        raise HTTPException(status_code=404, detail="Файл уже удалён по таймеру.")
+
+    path = Path(file_row["file_path"])
+    if not path.exists() or not path.is_file():
+        await db_execute(
+            "UPDATE downloaded_files SET deleted_at = ?, delete_reason = ? WHERE file_id = ?",
+            (iso(now_utc()), "missing_on_disk", file_row["file_id"]),
+        )
+        raise HTTPException(status_code=404, detail="Файл не найден на сервере.")
+
+    await mark_file_accessed(int(file_row["file_id"]))
+    headers = {
+        "X-Accel-Redirect": f"/_protected_downloads/{quote(file_row['stored_filename'])}",
+        "Content-Type": file_row.get("mime_type") or guess_mime_type(path),
+        "Content-Disposition": f'attachment; filename="{file_row["stored_filename"]}"',
+    }
+    return Response(status_code=200, headers=headers)
+
+
+@web.get("/media/watch/{token}")
+async def media_watch(request: Request, token: str):
+    file_row = await get_file_by_token(token)
+    if not file_row or file_row.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="Файл уже удалён или ссылка недействительна.")
+    expires_at = from_iso(file_row.get("expires_at"))
+    if expires_at and expires_at <= now_utc():
+        await delete_downloaded_file(int(file_row["file_id"]), "expired")
+        raise HTTPException(status_code=404, detail="Файл уже удалён по таймеру.")
+
+    path = Path(file_row["file_path"])
+    if not path.exists() or not path.is_file():
+        await db_execute(
+            "UPDATE downloaded_files SET deleted_at = ?, delete_reason = ? WHERE file_id = ?",
+            (iso(now_utc()), "missing_on_disk", file_row["file_id"]),
+        )
+        raise HTTPException(status_code=404, detail="Файл не найден на сервере.")
+
+    await mark_file_accessed(int(file_row["file_id"]))
+    headers = {
+        "X-Accel-Redirect": f"/_protected_watch/{quote(file_row['stored_filename'])}",
+        "Content-Type": file_row.get("mime_type") or guess_mime_type(path),
+        "Content-Disposition": f'inline; filename="{file_row["stored_filename"]}"',
+    }
+    return Response(status_code=200, headers=headers)
+
+
+@web.post("/api/proxy-download")
+async def api_proxy_download(
+    request: Request,
+    url: str = Form(...),
+    mode: str = Form("safe"),
+    quality_height: int | None = Form(None),
+):
+    user_id = await get_current_user_id(request)
+    settings = await get_settings()
+    if not setting_bool(settings, "experimental_proxy_download_enabled"):
+        raise HTTPException(status_code=403, detail="Экспериментальный режим отключён администратором.")
+
+    url = url.strip()
+    if not re.match(r"https?://\S+", url):
+        raise HTTPException(status_code=400, detail="Нужна корректная ссылка http/https.")
+
+    await enforce_storage_limits(settings)
+    await mark_user_seen(user_id, touch_activity=True)
+
+    task_id = "proxy_" + secrets.token_hex(8)
+    opts = build_base_ydl_opts(user_id, skip_download=False, quiet=False, task_id=task_id)
+    opts["max_filesize"] = setting_gb_to_bytes(settings, "experimental_proxy_max_file_gb", Decimal("2"))
+    max_height = quality_height or setting_int(settings, "default_user_quality", 1080)
+    if setting_bool(settings, "allow_unlimited_quality"):
+        max_height = quality_height or 0
+    opts["format"] = get_format_string(mode if mode in {"safe", "bestq", "any"} else "safe", None, max_height=max_height)
+
+    def _download_proxy() -> Path:
+        info = ydl_extract(clean_youtube_url(url), opts, download=True)
+        path_str = find_downloaded_file(info)
+        if not path_str:
+            raise RuntimeError("Файл не найден после скачивания.")
+        return Path(path_str)
+
+    try:
+        path = await asyncio.wait_for(asyncio.to_thread(_download_proxy), timeout=setting_int(settings, "experimental_proxy_max_duration_minutes", 30) * 60)
+    except asyncio.TimeoutError as exc:
+        await cleanup_temp_files(task_id)
+        raise HTTPException(status_code=504, detail="Экспериментальная загрузка превысила лимит времени.") from exc
+    except Exception as exc:
+        await cleanup_temp_files(task_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    filename = path.name
+    def _cleanup_proxy_files() -> None:
+        for temp_path in DOWNLOAD_PATH.glob(f"*{task_id}*"):
+            try:
+                if temp_path.is_file():
+                    temp_path.unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Failed to delete proxy temp file %s", temp_path)
+
+    return FileResponse(
+        path,
+        media_type=guess_mime_type(path),
+        filename=filename,
+        background=BackgroundTask(_cleanup_proxy_files),
+    )
 
 
 @web.post("/api/cleanup")
@@ -2095,6 +2731,58 @@ async def api_admin_overview(request: Request):
     user_id, _ = await require_admin_user(request)
     await mark_user_seen(user_id, touch_activity=True)
     return await get_admin_overview(request)
+
+
+
+@web.get("/api/admin/settings")
+async def api_admin_settings(request: Request):
+    user_id, _ = await require_admin_user(request)
+    await mark_user_seen(user_id, touch_activity=True)
+    return {"ok": True, "settings": settings_public_view(await get_settings())}
+
+
+@web.post("/api/admin/settings")
+async def api_admin_update_settings(request: Request):
+    user_id, _ = await require_admin_user(request)
+    await mark_user_seen(user_id, touch_activity=True)
+    form = await request.form()
+    settings = await update_settings_from_form(dict(form))
+    return {"ok": True, "settings": settings_public_view(settings), "overview": await get_admin_overview(request)}
+
+
+@web.get("/api/admin/files")
+async def api_admin_files(request: Request):
+    user_id, _ = await require_admin_user(request)
+    await mark_user_seen(user_id, touch_activity=True)
+    return {"ok": True, "files": await list_active_downloaded_files(request), "overview": await get_admin_overview(request)}
+
+
+@web.post("/api/admin/files/{file_id}/delete")
+async def api_admin_delete_file(request: Request, file_id: int):
+    user_id, _ = await require_admin_user(request)
+    await mark_user_seen(user_id, touch_activity=True)
+    await delete_downloaded_file(file_id, "admin_single")
+    return {"ok": True, "files": await list_active_downloaded_files(request), "overview": await get_admin_overview(request)}
+
+
+@web.post("/api/admin/files/cleanup-expired")
+async def api_admin_cleanup_expired_files(request: Request):
+    user_id, _ = await require_admin_user(request)
+    await mark_user_seen(user_id, touch_activity=True)
+    removed = await cleanup_expired_downloaded_files()
+    return {"ok": True, "removed": removed, "files": await list_active_downloaded_files(request), "overview": await get_admin_overview(request)}
+
+
+@web.post("/api/admin/files/cleanup-all")
+async def api_admin_cleanup_all_files(request: Request):
+    user_id, _ = await require_admin_user(request)
+    await mark_user_seen(user_id, touch_activity=True)
+    files = await db_fetchall("SELECT file_id FROM downloaded_files WHERE deleted_at IS NULL")
+    removed = 0
+    for item in files:
+        if await delete_downloaded_file(int(item["file_id"]), "admin_cleanup_all"):
+            removed += 1
+    return {"ok": True, "removed": removed, "files": await list_active_downloaded_files(request), "overview": await get_admin_overview(request)}
 
 
 @web.post("/api/admin/invites")

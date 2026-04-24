@@ -41,7 +41,6 @@ NONINTERACTIVE="${NONINTERACTIVE:-0}"
 APP_DOMAIN="${APP_DOMAIN:-}"
 WEB_BASE_PATH_INPUT="${WEB_BASE_PATH_INPUT:-}"
 WEB_PUBLIC_BASE_URL_INPUT="${WEB_PUBLIC_BASE_URL_INPUT:-}"
-DOWNLOAD_BASE_URL_INPUT="${DOWNLOAD_BASE_URL_INPUT:-}"
 WEB_SECRET_KEY_INPUT="${WEB_SECRET_KEY_INPUT:-}"
 WEB_LOGIN_KEY_INPUT="${WEB_LOGIN_KEY_INPUT:-}"
 WEB_ADMIN_LOGIN_KEY_INPUT="${WEB_ADMIN_LOGIN_KEY_INPUT:-}"
@@ -61,7 +60,6 @@ usage() {
   APP_DOMAIN=example.com
   WEB_BASE_PATH_INPUT=/hiddenpath
   WEB_PUBLIC_BASE_URL_INPUT=https://example.com
-  DOWNLOAD_BASE_URL_INPUT=https://example.com/files
   WEB_SECRET_KEY_INPUT=...
   WEB_LOGIN_KEY_INPUT=...
   WEB_ADMIN_LOGIN_KEY_INPUT=...
@@ -256,9 +254,6 @@ WEB_BASE_PATH_INPUT="${WEB_BASE_PATH_INPUT%/}"
 if [[ -z "${WEB_PUBLIC_BASE_URL_INPUT}" ]]; then
   WEB_PUBLIC_BASE_URL_INPUT="https://${APP_DOMAIN}"
 fi
-if [[ -z "${DOWNLOAD_BASE_URL_INPUT}" ]]; then
-  DOWNLOAD_BASE_URL_INPUT="https://${APP_DOMAIN}/files"
-fi
 if [[ -z "${WEB_SECRET_KEY_INPUT}" ]]; then
   WEB_SECRET_KEY_INPUT="$(gen_hex 32)"
 fi
@@ -395,10 +390,6 @@ SQLITE_DB_NAME=web_ytd.sqlite3
 # Через сколько дней чистить старых универсальных пользователей
 USER_RETENTION_DAYS=30
 
-# Очистка каждый день в это время (по серверу)
-CLEANUP_HOUR=4
-CLEANUP_MINUTE=10
-
 # Через сколько часов удалять старые завершённые задачи из памяти
 REQUEST_TTL_HOURS=1
 
@@ -409,12 +400,6 @@ REQUEST_TTL_HOURS=1
 DOWNLOAD_PATH=${DOWNLOAD_DIR}
 COOKIES_PATH=./cookies
 LOG_PATH=./logs
-
-# =========================
-# ССЫЛКА НА СКАЧИВАНИЕ
-# =========================
-
-DOWNLOAD_BASE_URL=${DOWNLOAD_BASE_URL_INPUT}
 
 # =========================
 # YT-DLP / DEBUG
@@ -450,7 +435,6 @@ mkdir -p /etc/angie/conf.d /etc/angie/http.d
 ensure_angie_http_include_conf_d
 disable_angie_default_site
 render_acme_conf > /etc/angie/http.d/00-acme.conf
-cp -f "${APP_DIR}/deploy/angie/download_filename_map.conf" /etc/angie/conf.d/download_filename_map.conf
 
 sed \
   -e "s|__APP_DOMAIN__|${APP_DOMAIN}|g" \

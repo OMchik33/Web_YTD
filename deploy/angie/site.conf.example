@@ -23,12 +23,26 @@ server {
     access_log /var/log/angie/__APP_DOMAIN__.access.log;
     error_log  /var/log/angie/__APP_DOMAIN__.error.log;
 
-    # Раздача скачанных файлов
-    location /files/ {
+    # Внутренняя раздача скачанных файлов.
+    # Наружу файлы открываются только через ссылки приложения:
+    # __WEB_BASE_PATH__/media/download/<token> и __WEB_BASE_PATH__/media/watch/<token>
+    location /_protected_downloads/ {
+        internal;
         alias /download/;
         autoindex off;
         try_files $uri =404;
-        add_header Content-Disposition $download_disposition;
+    }
+
+    location /_protected_watch/ {
+        internal;
+        alias /download/;
+        autoindex off;
+        try_files $uri =404;
+    }
+
+    # Старый прямой путь /files/ лучше закрыть, чтобы обходить учёт файлов в БД было нельзя.
+    location /files/ {
+        return 404;
     }
 
     # Само приложение под скрытым путём

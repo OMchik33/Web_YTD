@@ -12,6 +12,9 @@ const videoTitle = document.getElementById('video-title');
 const videoUrlView = document.getElementById('video-url-view');
 const formatsList = document.getElementById('formats-list');
 const thumbnailBtn = document.getElementById('thumbnail-btn');
+const qualitySelect = document.getElementById('quality-select');
+const proxyDownloadBtn = document.getElementById('proxy-download-btn');
+const proxyHelp = document.getElementById('proxy-help');
 
 const cookiesForm = document.getElementById('cookies-form');
 const cookiesStatus = document.getElementById('cookies-status');
@@ -32,6 +35,7 @@ const taskTitle = document.getElementById('task-title');
 const taskDetail = document.getElementById('task-detail');
 const taskResult = document.getElementById('task-result');
 const taskDownloadLink = document.getElementById('task-download-link');
+const taskWatchLink = document.getElementById('task-watch-link');
 const taskError = document.getElementById('task-error');
 const taskProgress = document.getElementById('task-progress');
 
@@ -50,7 +54,16 @@ const adminActiveTasks = document.getElementById('admin-active-tasks');
 const statActive5 = document.getElementById('stat-active-5');
 const statActive10 = document.getElementById('stat-active-10');
 const statActiveTasks = document.getElementById('stat-active-tasks');
+const statActiveFiles = document.getElementById('stat-active-files');
+const statDownloadUsage = document.getElementById('stat-download-usage');
+const statDiskFree = document.getElementById('stat-disk-free');
 const statSafeRestart = document.getElementById('stat-safe-restart');
+
+const adminSettingsForm = document.getElementById('admin-settings-form');
+const adminFilesList = document.getElementById('admin-files-list');
+const adminFilesEmpty = document.getElementById('admin-files-empty');
+const adminCleanupExpiredBtn = document.getElementById('admin-cleanup-expired-btn');
+const adminCleanupAllFilesBtn = document.getElementById('admin-cleanup-all-files-btn');
 
 const toastContainer = document.getElementById('toast-container');
 const themeToggleBtn = document.getElementById('theme-toggle');
@@ -315,6 +328,33 @@ function downloadThumbnail() {
   showToast('Открываю обложку.', 'info');
 }
 
+
+function updateQualitySelect(settings) {
+  if (!qualitySelect || !settings) {
+    return;
+  }
+  const options = settings.quality_options || [720, 1080];
+  qualitySelect.innerHTML = '';
+  options.forEach((height) => {
+    const option = document.createElement('option');
+    option.value = String(height);
+    option.textContent = height === 2160 ? '4K / 2160p' : `${height}p`;
+    qualitySelect.appendChild(option);
+  });
+  const defaultValue = String(settings.default_user_quality || 1080);
+  if ([...qualitySelect.options].some((opt) => opt.value === defaultValue)) {
+    qualitySelect.value = defaultValue;
+  }
+}
+
+function selectedQualityHeight() {
+  if (!qualitySelect || !qualitySelect.value) {
+    return null;
+  }
+  const parsed = Number.parseInt(qualitySelect.value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function renderAnalysis(data) {
   currentAnalysis = data;
 
@@ -333,6 +373,16 @@ function renderAnalysis(data) {
   }
   if (formatsList) {
     formatsList.innerHTML = '';
+  }
+
+  updateQualitySelect(data.settings || {});
+  if (proxyDownloadBtn) {
+    const enabled = Boolean(data.settings && data.settings.experimental_proxy_download_enabled);
+    proxyDownloadBtn.classList.toggle('hidden', !enabled);
+    proxyDownloadBtn.disabled = !enabled;
+  }
+  if (proxyHelp) {
+    proxyHelp.classList.toggle('hidden', !(data.settings && data.settings.experimental_proxy_download_enabled));
   }
 
   if (thumbnailBtn) {
@@ -382,6 +432,10 @@ function updateTaskUi(task) {
     taskResult.classList.remove('hidden');
     taskError.classList.add('hidden');
     taskDownloadLink.href = task.download_url;
+    if (taskWatchLink) {
+      taskWatchLink.href = task.watch_url || task.download_url;
+      taskWatchLink.classList.toggle('hidden', !(task.watch_url || task.download_url));
+    }
 
     if (!completedNotifiedTaskIds.has(notifyKey)) {
       completedNotifiedTaskIds.add(notifyKey);
@@ -440,6 +494,10 @@ async function startDownload(mode, formatId = null) {
   form.append('url', currentAnalysis.url);
   form.append('mode', mode);
   form.append('title', currentAnalysis.title || 'Видео');
+  const qualityHeight = selectedQualityHeight();
+  if (qualityHeight && mode !== 'audio' && mode !== 'pick') {
+    form.append('quality_height', String(qualityHeight));
+  }
 
   if (formatId) {
     form.append('format_id', formatId);
@@ -477,6 +535,54 @@ async function startDownload(mode, formatId = null) {
   }
 }
 
+
+async function startProxyDownload() {
+  if (!currentAnalysis) {
+    showToast('Сначала выполни анализ ссылки.', 'error');
+    return;
+  }
+  const form = new FormData();
+  form.append('url', currentAnalysis.url);
+  form.append('mode', 'safe');
+  const qualityHeight = selectedQualityHeight();
+  if (qualityHeight) {
+    form.append('quality_height', String(qualityHeight));
+  }
+
+  try {
+    setButtonLoading(proxyDownloadBtn, true, 'Экспериментально без хранения', 'Готовлю файл...');
+    const response = await fetch(apiUrl('/api/proxy-download'), {
+      method: 'POST',
+      body: form,
+    });
+    if (!response.ok) {
+      let message = `Ошибка запроса (${response.status})`;
+      try {
+        const data = await response.json();
+        message = data.detail || message;
+      } catch {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('content-disposition') || '';
+    const filenameMatch = disposition.match(/filename\*?=(?:UTF-8''|\")?([^\";]+)/i);
+    const filename = filenameMatch ? decodeURIComponent(filenameMatch[1].replaceAll('"', '').trim()) : 'clipsave-proxy-download';
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
+    showToast('Экспериментальная загрузка завершена.', 'success');
+  } catch (err) {
+    showToast(err.message, 'error', 6000);
+  } finally {
+    setButtonLoading(proxyDownloadBtn, false, 'Экспериментально без хранения', 'Готовлю файл...');
+  }
+}
+
 function setButtonLoading(button, loading, idleText, loadingText) {
   if (!button) {
     return;
@@ -497,6 +603,95 @@ async function copyTextToClipboard(text, successMessage = 'Скопирован�
   } catch (err) {
     showToast('Не удалось скопировать в буфер обмена.', 'error');
   }
+}
+
+
+function setInputValue(id, value) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.value = value == null ? '' : String(value);
+  }
+}
+
+function setCheckboxValue(id, value) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.checked = Boolean(value);
+  }
+}
+
+function applySettingsToForm(settings) {
+  if (!settings || !adminSettingsForm) {
+    return;
+  }
+  setInputValue('setting-download-retention', settings.download_retention_minutes);
+  setInputValue('setting-watch-extend', settings.watch_extend_minutes);
+  setInputValue('setting-max-file-gb', settings.max_single_file_gb);
+  setInputValue('setting-max-dir-gb', settings.max_download_dir_gb);
+  setInputValue('setting-min-free-gb', settings.min_free_disk_gb);
+  setInputValue('setting-max-video-height', settings.max_video_height);
+  setInputValue('setting-default-quality', settings.default_user_quality);
+  setCheckboxValue('setting-extend-watch', settings.extend_expiry_on_watch);
+  setCheckboxValue('setting-user-quality', settings.user_quality_selection_enabled);
+  setCheckboxValue('setting-unlimited-file', settings.allow_unlimited_file_size);
+  setCheckboxValue('setting-unlimited-dir', settings.allow_unlimited_download_dir);
+  setCheckboxValue('setting-unlimited-quality', settings.allow_unlimited_quality);
+  setCheckboxValue('setting-proxy-enabled', settings.experimental_proxy_download_enabled);
+  setInputValue('setting-proxy-max-gb', settings.experimental_proxy_max_file_gb);
+  setInputValue('setting-proxy-minutes', settings.experimental_proxy_max_duration_minutes);
+}
+
+function renderAdminFiles(files) {
+  if (!adminFilesList || !adminFilesEmpty) {
+    return;
+  }
+
+  adminFilesList.innerHTML = '';
+
+  if (!Array.isArray(files) || !files.length) {
+    adminFilesEmpty.classList.remove('hidden');
+    return;
+  }
+
+  adminFilesEmpty.classList.add('hidden');
+
+  files.forEach((file) => {
+    const item = document.createElement('article');
+    item.className = 'admin-file-item';
+    item.innerHTML = `
+      <div class="admin-file-main">
+        <strong class="mono-input">${escapeHtml(file.stored_filename || 'файл')}</strong>
+        <div class="muted admin-file-meta">
+          Пользователь: ${escapeHtml(file.user_label || file.user_id || '—')} ·
+          Размер: ${escapeHtml(file.file_size_text || '—')} ·
+          Качество: ${escapeHtml(file.quality_label || '—')} ·
+          Осталось: ${escapeHtml(file.time_left_text || '—')} ·
+          Просмотров: ${escapeHtml(file.access_count ?? 0)}
+        </div>
+      </div>
+      <div class="admin-file-actions-row">
+        <a class="ghost-btn small-btn" href="${escapeHtml(file.watch_url || '#')}" target="_blank" rel="noopener">Просмотреть</a>
+        <a class="ghost-btn small-btn" href="${escapeHtml(file.download_url || '#')}" target="_blank" rel="noopener">Скачать</a>
+        <button class="ghost-btn small-btn danger-btn admin-file-delete-btn" type="button">Удалить</button>
+      </div>
+    `;
+
+    item.querySelector('.admin-file-delete-btn')?.addEventListener('click', async () => {
+      if (!window.confirm(`Удалить файл ${file.stored_filename || ''}?`)) {
+        return;
+      }
+      try {
+        const data = await fetchJson(apiUrl(`/api/admin/files/${file.file_id}/delete`), { method: 'POST' });
+        renderAdminFiles(data.files || []);
+        applyAdminOverview(data.overview);
+        showToast('Файл удалён.', 'success');
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+
+    adminFilesList.appendChild(item);
+  });
 }
 
 function renderActiveTasks(tasks) {
@@ -672,6 +867,15 @@ function applyAdminOverview(overview) {
   if (statActiveTasks) {
     statActiveTasks.textContent = String(overview.stats?.active_tasks ?? '—');
   }
+  if (statActiveFiles) {
+    statActiveFiles.textContent = String(overview.stats?.active_files ?? '—');
+  }
+  if (statDownloadUsage) {
+    statDownloadUsage.textContent = overview.disk?.download_usage_text || '—';
+  }
+  if (statDiskFree) {
+    statDiskFree.textContent = overview.disk?.disk_free_text || '—';
+  }
   if (statSafeRestart) {
     statSafeRestart.textContent = overview.stats?.safe_to_restart ? 'Да' : 'Нет';
     statSafeRestart.classList.toggle('safe-yes', Boolean(overview.stats?.safe_to_restart));
@@ -682,6 +886,8 @@ function applyAdminOverview(overview) {
     universalLoginUrl.value = overview.links?.universal_login_url || '';
   }
 
+  applySettingsToForm(overview.settings || {});
+  renderAdminFiles(overview.files || []);
   renderInvites(overview.invites || []);
   renderActiveTasks(overview.active_tasks || []);
 }
@@ -864,6 +1070,49 @@ copyLatestInviteBtn?.addEventListener('click', () => {
 
 copyUniversalLoginBtn?.addEventListener('click', () => {
   copyTextToClipboard(universalLoginUrl?.value || '', 'Основная ссылка скопирована.');
+});
+
+
+
+proxyDownloadBtn?.addEventListener('click', startProxyDownload);
+
+adminSettingsForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = new FormData(adminSettingsForm);
+
+  try {
+    const data = await postForm(apiUrl('/api/admin/settings'), form);
+    applySettingsToForm(data.settings || {});
+    applyAdminOverview(data.overview);
+    showToast('Настройки сохранены.', 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+});
+
+adminCleanupExpiredBtn?.addEventListener('click', async () => {
+  try {
+    const data = await fetchJson(apiUrl('/api/admin/files/cleanup-expired'), { method: 'POST' });
+    renderAdminFiles(data.files || []);
+    applyAdminOverview(data.overview);
+    showToast(`Просроченные файлы удалены: ${data.removed || 0}.`, 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+});
+
+adminCleanupAllFilesBtn?.addEventListener('click', async () => {
+  if (!window.confirm('Удалить все загруженные файлы? Это действие нельзя отменить.')) {
+    return;
+  }
+  try {
+    const data = await fetchJson(apiUrl('/api/admin/files/cleanup-all'), { method: 'POST' });
+    renderAdminFiles(data.files || []);
+    applyAdminOverview(data.overview);
+    showToast(`Файлы удалены: ${data.removed || 0}.`, 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
 });
 
 themeToggleBtn?.addEventListener('click', toggleTheme);
