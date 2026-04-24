@@ -1318,3 +1318,49 @@ body[data-theme="light"] .progress-bar.is-active {
   .admin-file-item { grid-template-columns: 1fr; }
   .admin-file-actions-row { width: 100%; }
 }
+
+/* Fix: quality selector hint must not overlap with the select field */
+.quality-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.quality-panel .helper-text-compact {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.quality-panel .text-input {
+  min-height: 54px;
+}
+
+/* Fix: spacing for proxy hint and admin sections */
+.download-actions + .proxy-help {
+  margin-top: 14px;
+}
+
+.proxy-help.helper-text {
+  margin-bottom: 18px;
+}
+
+.admin-bottom-section {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.admin-bottom-section > .section-card {
+  margin: 0;
+}
+
+@media (max-width: 1120px) {
+  .admin-bottom-section {
+    gap: 20px;
+  }
+}
+
+@media (max-width: 760px) {
+  .admin-bottom-section {
+    gap: 16px;
+  }
+}

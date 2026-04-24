@@ -24,9 +24,10 @@ APP_SERVICE="ytd_web"
 BACKUP_DIR="/opt/telegram-bots/ytd_web/backups/db"
 WEB_HOST="127.0.0.1"
 WEB_PORT="8093"
-APT_PACKAGES="git ca-certificates curl unzip ffmpeg nodejs python3 python3-venv python3-pip sqlite3 cron ufw rsync gnupg"
+APT_PACKAGES="git ca-certificates curl unzip ffmpeg python3 python3-venv python3-pip sqlite3 cron ufw rsync gnupg"
 ANGIE_REPO_CHANNEL="main"
 ACME_RESOLVER="1.1.1.1 1.0.0.1 valid=300s ipv6=off"
+NODEJS_MAJOR="22"
 
 if [[ -n "${VERSIONS_FILE}" && -f "${VERSIONS_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -192,6 +193,40 @@ EOF2
   fi
 }
 
+
+install_nodejs_runtime() {
+  echo "==> Установка Node.js ${NODEJS_MAJOR}.x для yt-dlp / YouTube EJS"
+  install -d -m 0755 /etc/apt/keyrings
+
+  if ! command -v node >/dev/null 2>&1 || ! node -v | grep -Eq "^v${NODEJS_MAJOR}\."; then
+    curl -fsSL "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" \
+      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+    chmod 644 /etc/apt/keyrings/nodesource.gpg
+
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODEJS_MAJOR}.x nodistro main" \
+      > /etc/apt/sources.list.d/nodesource.list
+
+    apt-get update
+    apt-get install -y nodejs
+  else
+    echo "Node.js уже установлен: $(node -v)"
+  fi
+
+  if ! command -v node >/dev/null 2>&1; then
+    echo "Node.js не установлен или не найден в PATH" >&2
+    exit 1
+  fi
+
+  local node_major
+  node_major="$(node -v | sed -E 's/^v([0-9]+).*/\1/')"
+  if [[ "${node_major}" -lt 20 ]]; then
+    echo "Нужен Node.js 20+ для стабильной работы yt-dlp EJS. Сейчас: $(node -v)" >&2
+    exit 1
+  fi
+
+  echo "Node.js: $(command -v node) $(node -v)"
+}
+
 echo "==> Подготовка базовых пакетов"
 apt-get update
 apt-get install -y ca-certificates curl git gnupg
@@ -268,6 +303,7 @@ if [[ -z "${ACME_EMAIL_INPUT}" ]]; then
 fi
 
 echo "==> Установка пакетов ОС"
+install_nodejs_runtime
 apt-get update
 apt-get install -y ${APT_PACKAGES}
 
@@ -456,7 +492,7 @@ cat > /etc/cron.d/ytd_web <<CRONEOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-*/5 * * * * root find ${DOWNLOAD_DIR} -type f -mmin +30 -delete
+# Автоудаление скачанных файлов выполняет сам веб-сервис ClipSave через SQLite-настройки.
 0 4 * * * root before=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); /usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && pip install -U --no-deps yt-dlp yt-dlp-ejs'; after=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); [ "\$before" != "\$after" ] && /usr/bin/systemctl restart ${APP_SERVICE} || true
 CRONEOF
 chmod 644 /etc/cron.d/ytd_web
@@ -482,6 +518,7 @@ echo "  Админ:        ${WEB_PUBLIC_BASE_URL_INPUT}${WEB_BASE_PATH_INPUT}/lo
 echo
 echo "Полезные команды:"
 echo "  systemctl status ${APP_SERVICE} --no-pager"
+echo "  node -v"
 echo "  systemctl status angie --no-pager"
 echo "  ufw status verbose"
 echo "  grep -i acme /var/log/angie/error.log | tail -n 50"
