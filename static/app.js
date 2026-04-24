@@ -670,8 +670,6 @@ function renderAdminFiles(files) {
         </div>
       </div>
       <div class="admin-file-actions-row">
-        <a class="ghost-btn small-btn" href="${escapeHtml(file.watch_url || '#')}" target="_blank" rel="noopener">Просмотреть</a>
-        <a class="ghost-btn small-btn" href="${escapeHtml(file.download_url || '#')}" target="_blank" rel="noopener">Скачать</a>
         <button class="ghost-btn small-btn danger-btn admin-file-delete-btn" type="button">Удалить</button>
       </div>
     `;
