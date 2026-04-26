@@ -1092,6 +1092,54 @@ def build_quality_label(mode: str, format_id: str | None, requested_height: int 
     return mode
 
 
+def bytes_limit_error(max_bytes: int) -> str:
+    return f"Файл больше лимита, заданного администратором ({fmt_size(max_bytes)}). Выбери качество ниже."
+
+
+def estimate_info_size_bytes(info: dict[str, Any] | None) -> int:
+    if not isinstance(info, dict):
+        return 0
+
+    requested_formats = info.get("requested_formats")
+    if isinstance(requested_formats, list) and requested_formats:
+        total = 0
+        has_known_size = False
+        for item in requested_formats:
+            if not isinstance(item, dict):
+                continue
+            size = int(item.get("filesize") or item.get("filesize_approx") or 0)
+            if size > 0:
+                total += size
+                has_known_size = True
+        if has_known_size:
+            return total
+
+    requested_downloads = info.get("requested_downloads")
+    if isinstance(requested_downloads, list) and requested_downloads:
+        total = 0
+        has_known_size = False
+        for item in requested_downloads:
+            if not isinstance(item, dict):
+                continue
+            size = int(item.get("filesize") or item.get("filesize_approx") or item.get("total_bytes") or item.get("total_bytes_estimate") or 0)
+            if size > 0:
+                total += size
+                has_known_size = True
+        if has_known_size:
+            return total
+
+    return int(info.get("filesize") or info.get("filesize_approx") or 0)
+
+
+def enforce_single_file_size_limit_by_value(size_bytes: int, max_bytes: int | None) -> None:
+    if max_bytes and size_bytes and size_bytes > max_bytes:
+        raise RuntimeError(bytes_limit_error(max_bytes))
+
+
+def enforce_single_file_size_limit_by_info(info: dict[str, Any] | None, max_bytes: int | None) -> None:
+    enforce_single_file_size_limit_by_value(estimate_info_size_bytes(info), max_bytes)
+
+
 async def register_downloaded_file(
     *,
     user_id: str,
@@ -1146,11 +1194,11 @@ def file_public_links(request: Request, token: str) -> dict[str, str]:
     }
 
 
-async def mark_file_accessed(file_id: int) -> None:
+async def mark_file_accessed(file_id: int, *, extend_expiry: bool) -> None:
     settings = await get_settings()
     now = now_utc()
     expires = None
-    if setting_bool(settings, "extend_expiry_on_watch"):
+    if extend_expiry and setting_bool(settings, "extend_expiry_on_watch"):
         expires = iso(now + dt.timedelta(minutes=setting_int(settings, "watch_extend_minutes", 240)))
 
     if expires:
@@ -1628,8 +1676,10 @@ def sync_download_media(
 ) -> dict[str, Any]:
     opts = build_base_ydl_opts(user_id, skip_download=False, quiet=False, task_id=task_id)
     settings = _get_settings_sync()
+    max_file_bytes = None
     if not setting_bool(settings, "allow_unlimited_file_size"):
-        opts["max_filesize"] = setting_gb_to_bytes(settings, "max_single_file_gb", Decimal("4"))
+        max_file_bytes = setting_gb_to_bytes(settings, "max_single_file_gb", Decimal("4"))
+        opts["max_filesize"] = max_file_bytes
     max_height = setting_int(settings, "max_video_height", 1080)
     if setting_bool(settings, "allow_unlimited_quality"):
         max_height = 0
@@ -1654,6 +1704,8 @@ def sync_download_media(
 
                 downloaded = data.get("downloaded_bytes") or 0
                 total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                enforce_single_file_size_limit_by_value(total, max_file_bytes)
+                enforce_single_file_size_limit_by_value(downloaded, max_file_bytes)
                 speed = data.get("speed")
                 eta = data.get("eta")
 
@@ -1692,6 +1744,8 @@ def sync_download_media(
                     status_label="Обработка",
                     detail="Скачивание завершено, выполняю обработку ffmpeg",
                 )
+        except RuntimeError:
+            raise
         except Exception:
             logger.exception("Progress hook error for task_id=%s", task_id)
 
@@ -1761,8 +1815,24 @@ def sync_download_media(
         new_opts.pop("cookiefile", None)
         return new_opts
 
+    def ydl_extract_checked(source_opts: dict[str, Any]) -> dict[str, Any]:
+        if max_file_bytes:
+            check_opts = dict(source_opts)
+            check_opts["skip_download"] = True
+            check_opts["quiet"] = True
+            check_opts["no_warnings"] = True
+            check_opts["progress_hooks"] = []
+            check_opts["postprocessor_hooks"] = []
+            check_opts.pop("downloader", None)
+            check_info = ydl_extract(url, check_opts, download=False)
+            enforce_single_file_size_limit_by_info(check_info, max_file_bytes)
+
+        downloaded_info = ydl_extract(url, source_opts, download=True)
+        enforce_single_file_size_limit_by_info(downloaded_info, max_file_bytes)
+        return downloaded_info
+
     try:
-        info = ydl_extract(url, opts, download=True)
+        info = ydl_extract_checked(opts)
     except Exception as e1:
         logger.warning("Primary download failed. err=%s", e1)
 
@@ -1778,7 +1848,7 @@ def sync_download_media(
 
             opts_no_cookie = make_no_cookie_opts(opts)
             try:
-                info = ydl_extract(url, opts_no_cookie, download=True)
+                info = ydl_extract_checked(opts_no_cookie)
             except Exception as e_no_cookie_1:
                 logger.warning("No-cookie download failed, retry with ffmpeg downloader. err=%s", e_no_cookie_1)
                 schedule_task_update(
@@ -1793,7 +1863,7 @@ def sync_download_media(
                 opts_no_cookie_ff["downloader"] = "ffmpeg"
 
                 try:
-                    info = ydl_extract(url, opts_no_cookie_ff, download=True)
+                    info = ydl_extract_checked(opts_no_cookie_ff)
                 except Exception as e_no_cookie_2:
                     logger.warning("No-cookie fallback download failed. err=%s", e_no_cookie_2)
                     raise RuntimeError(human_download_error(e_no_cookie_2)) from e_no_cookie_2
@@ -1811,7 +1881,7 @@ def sync_download_media(
             opts_ff["downloader"] = "ffmpeg"
 
             try:
-                info = ydl_extract(url, opts_ff, download=True)
+                info = ydl_extract_checked(opts_ff)
             except Exception as e2:
                 logger.warning("Fallback download failed. err=%s", e2)
                 raise RuntimeError(human_download_error(e2)) from e2
@@ -1826,6 +1896,11 @@ def sync_download_media(
     unique = f"{hashlib.md5((title + task_id).encode()).hexdigest()[:8]}_{int(time.time())}.{ext}"
     final = DOWNLOAD_PATH / unique
     os.replace(path, final)
+    try:
+        enforce_single_file_size_limit_by_value(final.stat().st_size, max_file_bytes)
+    except Exception:
+        final.unlink(missing_ok=True)
+        raise
 
     return {
         "title": title,
@@ -2718,7 +2793,7 @@ async def media_download(request: Request, token: str):
         )
         raise HTTPException(status_code=404, detail="Файл не найден на сервере.")
 
-    await mark_file_accessed(int(file_row["file_id"]))
+    await mark_file_accessed(int(file_row["file_id"]), extend_expiry=False)
     headers = {
         "X-Accel-Redirect": f"/_protected_downloads/{quote(file_row['stored_filename'])}",
         "Content-Type": file_row.get("mime_type") or guess_mime_type(path),
@@ -2745,7 +2820,7 @@ async def media_watch(request: Request, token: str):
         )
         raise HTTPException(status_code=404, detail="Файл не найден на сервере.")
 
-    await mark_file_accessed(int(file_row["file_id"]))
+    await mark_file_accessed(int(file_row["file_id"]), extend_expiry=True)
     headers = {
         "X-Accel-Redirect": f"/_protected_watch/{quote(file_row['stored_filename'])}",
         "Content-Type": file_row.get("mime_type") or guess_mime_type(path),
@@ -2936,6 +3011,8 @@ async def api_proxy_download(
     try:
         info = await asyncio.to_thread(ydl_extract, clean_youtube_url(url), opts, download=False)
         video_fmt, audio_fmt = _proxy_pick_formats(info, max_height, max_file_bytes)
+        proxy_known_size = _proxy_size(video_fmt) + _proxy_size(audio_fmt)
+        enforce_single_file_size_limit_by_value(proxy_known_size, max_file_bytes)
     except Exception as exc:
         logger.warning("Proxy prepare failed. err=%s", exc)
         raise HTTPException(status_code=500, detail=human_download_error(exc)) from exc
@@ -2952,6 +3029,7 @@ async def api_proxy_download(
         "source_url": clean_youtube_url(url),
         "title": title,
         "expires_at": expires_at,
+        "max_file_bytes": max_file_bytes,
     }
 
     async with proxy_stream_lock:
@@ -3028,11 +3106,18 @@ async def proxy_stream_download(request: Request, kind: str, token: str):
             stream=True,
         )
         upstream.raise_for_status()
+        max_file_bytes = item.get("max_file_bytes")
+        content_length = int(upstream.headers.get("Content-Length") or 0)
+        if max_file_bytes and content_length and content_length > max_file_bytes:
+            raise HTTPException(status_code=413, detail=bytes_limit_error(max_file_bytes))
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code if exc.response else 502
         await client.aclose()
         logger.warning("Proxy upstream HTTP error: status=%s token=%s", status_code, token)
         raise HTTPException(status_code=502, detail=f"Источник вернул ошибку HTTP {status_code}. Создай прокси-ссылку заново.") from exc
+    except HTTPException:
+        await client.aclose()
+        raise
     except Exception as exc:
         await client.aclose()
         logger.warning("Proxy upstream open failed. err=%s", exc)
@@ -3045,6 +3130,10 @@ async def proxy_stream_download(request: Request, kind: str, token: str):
             async for chunk in upstream.aiter_bytes(chunk_size=4 * 1024 * 1024):
                 if await request.is_disconnected():
                     logger.info("Proxy stream client disconnected: kind=%s token=%s bytes=%s", kind, token, sent_bytes)
+                    break
+                max_file_bytes = item.get("max_file_bytes")
+                if max_file_bytes and sent_bytes + len(chunk) > max_file_bytes:
+                    logger.warning("Proxy stream stopped by size limit: kind=%s token=%s limit=%s", kind, token, max_file_bytes)
                     break
                 sent_bytes += len(chunk)
                 yield chunk
