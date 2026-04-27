@@ -112,7 +112,7 @@ function applyTheme(theme) {
 }
 
 function initTheme() {
-  const savedTheme = getCookie('web_ytd_theme') || 'dark';
+  const savedTheme = getCookie('clipsave_theme') || 'dark';
   applyTheme(savedTheme);
 }
 
@@ -120,7 +120,7 @@ function toggleTheme() {
   const current = document.body.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
   const next = current === 'dark' ? 'light' : 'dark';
   applyTheme(next);
-  setCookie('web_ytd_theme', next, 180);
+  setCookie('clipsave_theme', next, 180);
 }
 
 function showToast(message, type = 'info', timeout = 3800) {
