@@ -17,11 +17,11 @@ PYTHON_VERSION="3.12"
 APP_USER="botrunner"
 APP_GROUP="botrunner"
 APP_HOME="/opt/telegram-bots"
-APP_DIR="/opt/telegram-bots/ytd_web"
+APP_DIR="/opt/telegram-bots/clipsave"
 VENV_DIR="/opt/telegram-bots/venv"
 DOWNLOAD_DIR="/download"
 APP_SERVICE="clipsave"
-BACKUP_DIR="/opt/telegram-bots/ytd_web/backups/db"
+BACKUP_DIR="/opt/telegram-bots/clipsave/backups/db"
 WEB_HOST="127.0.0.1"
 WEB_PORT="8093"
 APT_PACKAGES="git ca-certificates curl unzip ffmpeg python3 python3-venv python3-pip sqlite3 cron ufw rsync gnupg"
@@ -253,7 +253,7 @@ if [[ "${INSTALL_MODE}" == "git" ]]; then
     exit 1
   fi
 
-  TMP_CLONE_DIR="$(mktemp -d /tmp/ytd_web_src.XXXXXX)"
+  TMP_CLONE_DIR="$(mktemp -d /tmp/clipsave_src.XXXXXX)"
   echo "==> Клонирование репозитория: ${GIT_REPO_URL} (branch: ${GIT_BRANCH})"
   git clone --depth 1 --branch "${GIT_BRANCH}" "${GIT_REPO_URL}" "${TMP_CLONE_DIR}"
   SOURCE_ROOT="${TMP_CLONE_DIR}"
@@ -461,7 +461,7 @@ sed \
   -e "s|__APP_GROUP__|${APP_GROUP}|g" \
   -e "s|__APP_DIR__|${APP_DIR}|g" \
   -e "s|__VENV_DIR__|${VENV_DIR}|g" \
-  "${APP_DIR}/deploy/systemd/ytd_web.service" > "/etc/systemd/system/${APP_SERVICE}.service"
+  "${APP_DIR}/deploy/systemd/clipsave.service" > "/etc/systemd/system/${APP_SERVICE}.service"
 
 systemctl daemon-reload
 systemctl enable --now "${APP_SERVICE}"
@@ -488,14 +488,14 @@ ufw allow 443/tcp >/dev/null 2>&1 || true
 ufw --force enable >/dev/null 2>&1 || true
 
 echo "==> Установка cron-заданий"
-cat > /etc/cron.d/ytd_web <<CRONEOF
+cat > /etc/cron.d/clipsave <<CRONEOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Автоудаление скачанных файлов выполняет сам веб-сервис ClipSave через SQLite-настройки.
 0 4 * * * root before=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); /usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && pip install -U --no-deps yt-dlp yt-dlp-ejs'; after=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); [ "\$before" != "\$after" ] && /usr/bin/systemctl restart ${APP_SERVICE} || true
 CRONEOF
-chmod 644 /etc/cron.d/ytd_web
+chmod 644 /etc/cron.d/clipsave
 
 echo
 if [[ "${INSTALL_MODE}" == "git" ]]; then
