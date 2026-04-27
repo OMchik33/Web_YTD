@@ -29,8 +29,10 @@ ClipSave — веб-сервис на FastAPI для скачивания вид
 ```
 sudo apt update
 sudo apt install -y git
-git clone https://github.com/OMchik33/Web_YTD.git /root/web-ytd-src
-cd /root/web-ytd-src
+
+git clone https://github.com/OMchik33/ClipSave.git /root/clipsave-src
+cd /root/clipsave-src
+
 sudo bash scripts/install.sh
 ```
 В этом варианте скрипт разворачивает сервис из уже клонированного репозитория.
