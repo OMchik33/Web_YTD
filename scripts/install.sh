@@ -95,7 +95,7 @@ fi
 
 has_local_source() {
   local d="$1"
-  [[ -f "${d}/web_ytd.py" && -f "${d}/requirements.txt" && -d "${d}/templates" && -d "${d}/static" && -d "${d}/deploy" ]]
+  [[ -f "${d}/clipsave.py" && -f "${d}/requirements.txt" && -d "${d}/templates" && -d "${d}/static" && -d "${d}/deploy" ]]
 }
 
 prompt_or_default() {
@@ -265,7 +265,7 @@ if [[ "${INSTALL_MODE}" == "git" ]]; then
 elif [[ "${INSTALL_MODE}" == "local" ]]; then
   if ! has_local_source "${LOCAL_SOURCE_DIR}"; then
     echo "Не найден локальный набор файлов проекта в ${LOCAL_SOURCE_DIR}" >&2
-    echo "Ожидаются: web_ytd.py, requirements.txt, templates/, static/, deploy/" >&2
+    echo "Ожидаются: clipsave.py, requirements.txt, templates/, static/, deploy/" >&2
     exit 1
   fi
   SOURCE_ROOT="${LOCAL_SOURCE_DIR}"
@@ -395,8 +395,8 @@ WEB_LOGIN_KEY=${WEB_LOGIN_KEY_INPUT}
 WEB_ADMIN_LOGIN_KEY=${WEB_ADMIN_LOGIN_KEY_INPUT}
 
 # Названия cookies
-WEB_COOKIE_UID=web_ytd_uid
-WEB_COOKIE_SESSION=web_ytd_session
+WEB_COOKIE_UID=clipsave_uid
+WEB_COOKIE_SESSION=clipsave_session
 
 # Время жизни cookies
 WEB_UID_MAX_AGE=15552000
@@ -417,11 +417,11 @@ MAX_ACTIVE_TASKS_PER_USER=1
 DATA_PATH=./data
 
 # Можно указать либо имя файла БД внутри DATA_PATH...
-SQLITE_DB_NAME=web_ytd.sqlite3
+SQLITE_DB_NAME=clipsave.sqlite3
 
 # ...либо абсолютный/относительный путь целиком.
 # Если SQLITE_PATH задан, он имеет приоритет над SQLITE_DB_NAME.
-# SQLITE_PATH=./data/web_ytd.sqlite3
+# SQLITE_PATH=./data/clipsave.sqlite3
 
 # Через сколько дней чистить старых универсальных пользователей
 USER_RETENTION_DAYS=30
