@@ -1024,6 +1024,39 @@ def fmt_eta(seconds: float | int | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def clamp_progress_percent(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return max(0.0, min(100.0, round(float(value), 1)))
+    except Exception:
+        return None
+
+
+def build_progress_payload(
+    *,
+    state: str,
+    kind: str = "indeterminate",
+    percent: float | int | None = None,
+    downloaded: int | float | None = None,
+    total: int | float | None = None,
+    speed: int | float | None = None,
+    label: str = "",
+) -> dict[str, Any]:
+    percent_value = clamp_progress_percent(percent)
+    return {
+        "state": state,
+        "kind": "determinate" if kind == "determinate" and percent_value is not None else "indeterminate",
+        "percent": percent_value,
+        "downloaded_bytes": int(downloaded or 0),
+        "total_bytes": int(total or 0),
+        "downloaded_text": fmt_size(downloaded),
+        "total_text": fmt_size(total),
+        "speed_text": fmt_speed(speed),
+        "label": label,
+    }
+
+
 def guess_mime_type(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".mp4":
@@ -1382,20 +1415,32 @@ def get_format_string(mode: str, format_id: str | None, max_height: int = 0) -> 
 
     The limit is applied to the largest frame side, so vertical Shorts
     are not rejected by a simple height<=720 filter.
+
+    VK video may expose direct ready-to-download MP4 formats named
+    url1080/url720/url480/etc. Prefer them before HLS/fMP4 formats,
+    because some VK HLS/fMP4 manifests can fail with "Conflicting range".
     """
+    direct_vk_formats = ["url2160", "url1440", "url1080", "url720", "url480", "url360", "url240", "url144"]
+
     if max_height and max_height > 0:
-        max_side = int(max_height) * 2
+        max_height_int = int(max_height)
+        max_side = max_height_int * 2
         video_filter = f"[width<={max_side}][height<={max_side}]"
+        direct_vk_selector = "/".join(
+            fmt for fmt in direct_vk_formats
+            if int(fmt.replace("url", "")) <= max_height_int
+        )
     else:
         video_filter = ""
+        direct_vk_selector = "/".join(direct_vk_formats)
 
     if mode == "pick" and format_id:
         return f"{format_id}+ba/{format_id}/b"
 
     if video_filter:
-        return f"bv*{video_filter}+ba/b{video_filter}/bv*+ba/b"
+        return f"{direct_vk_selector}/bv*{video_filter}+ba/b{video_filter}/bv*+ba/b"
 
-    return "bv*+ba/b"
+    return f"{direct_vk_selector}/bv*+ba/b"
 
 
 def ydl_extract(url: str, opts: dict[str, Any], *, download: bool):
@@ -1673,6 +1718,7 @@ def init_task(user_id: str, url: str) -> dict[str, Any]:
         "cancel_requested": False,
         "cancelled_by": None,
         "thumbnail_url": None,
+        "progress": build_progress_payload(state="queued", label="Ожидание очереди"),
     }
     active_tasks[task_id] = task
     return task
@@ -1761,24 +1807,19 @@ def sync_download_media(
                 enforce_single_file_size_limit_by_value(total, max_file_bytes)
                 enforce_single_file_size_limit_by_value(downloaded, max_file_bytes)
                 speed = data.get("speed")
-                eta = data.get("eta")
 
+                percent = None
                 parts: list[str] = []
 
                 if total:
-                    percent = int((downloaded / total) * 100) if total > 0 else 0
-                    parts.append(f"{percent}%")
+                    percent = (downloaded / total) * 100 if total > 0 else 0
                     parts.append(f"{fmt_size(downloaded)} / {fmt_size(total)}")
                 elif downloaded:
-                    parts.append(fmt_size(downloaded))
+                    parts.append(f"Скачано {fmt_size(downloaded)}")
 
                 speed_text = fmt_speed(speed)
                 if speed_text:
                     parts.append(speed_text)
-
-                eta_text = fmt_eta(eta)
-                if eta_text:
-                    parts.append(f"ETA {eta_text}")
 
                 detail = " • ".join(parts) if parts else "Скачивание файла"
 
@@ -1788,6 +1829,15 @@ def sync_download_media(
                     status="downloading",
                     status_label="Скачивание",
                     detail=detail,
+                    progress=build_progress_payload(
+                        state="downloading",
+                        kind="determinate" if total else "indeterminate",
+                        percent=percent,
+                        downloaded=downloaded,
+                        total=total,
+                        speed=speed,
+                        label="Скачивание",
+                    ),
                 )
 
             elif status == "finished":
@@ -1797,6 +1847,12 @@ def sync_download_media(
                     status="processing",
                     status_label="Обработка",
                     detail="Скачивание завершено, выполняю обработку ffmpeg",
+                    progress=build_progress_payload(
+                        state="processing",
+                        kind="determinate",
+                        percent=100,
+                        label="Обработка файла",
+                    ),
                 )
         except RuntimeError:
             raise
@@ -1816,6 +1872,12 @@ def sync_download_media(
                     status="processing",
                     status_label="Обработка",
                     detail=f"Обработка {postprocessor}",
+                    progress=build_progress_payload(
+                        state="processing",
+                        kind="determinate",
+                        percent=100,
+                        label="Обработка файла",
+                    ),
                 )
             elif status == "finished":
                 schedule_task_update(
@@ -1824,6 +1886,12 @@ def sync_download_media(
                     status="processing",
                     status_label="Обработка",
                     detail="Финальная подготовка файла",
+                    progress=build_progress_payload(
+                        state="processing",
+                        kind="determinate",
+                        percent=100,
+                        label="Финальная подготовка",
+                    ),
                 )
         except Exception:
             logger.exception("Postprocessor hook error for task_id=%s", task_id)
@@ -2047,6 +2115,12 @@ async def download_worker(worker_index: int) -> None:
                 error=None,
                 done=True,
                 queue_position=None,
+                progress=build_progress_payload(
+                    state="done",
+                    kind="determinate",
+                    percent=100,
+                    label="Готово",
+                ),
             )
 
             await update_last_download_at(user_id)
@@ -2083,6 +2157,7 @@ async def download_worker(worker_index: int) -> None:
                 error=str(exc),
                 done=True,
                 queue_position=None,
+                progress=build_progress_payload(state="cancelled", label="Отменено"),
             )
 
             if user_id and mode and url:
@@ -2114,6 +2189,7 @@ async def download_worker(worker_index: int) -> None:
                 error=str(exc),
                 done=True,
                 queue_position=None,
+                progress=build_progress_payload(state="error", label="Ошибка"),
             )
 
             if user_id and mode and url:
@@ -2471,6 +2547,7 @@ async def get_admin_overview(request: Request) -> dict[str, Any]:
                 "detail": task.get("detail"),
                 "updated_at": task.get("updated_at"),
                 "cancel_requested": bool(task.get("cancel_requested")),
+                "progress": task.get("progress"),
             }
         )
 
@@ -2858,6 +2935,7 @@ async def api_download(
         "status_label": task["status_label"],
         "detail": task["detail"],
         "queue_position": task.get("queue_position"),
+        "progress": task.get("progress"),
     }
 
 
