@@ -41,7 +41,7 @@ set +a
 # =========================
 
 PROJECT_DIR="$(cd "$(dirname "$ENV_FILE")" && pwd)"
-SERVICE_NAME="${SERVICE_NAME:-ytd_web}"
+SERVICE_NAME="${SERVICE_NAME:-clipsave}"
 
 resolve_path() {
   local value="$1"
@@ -60,7 +60,7 @@ DATA_PATH_RESOLVED="$(resolve_path "$DATA_PATH_VALUE")"
 if [[ -n "${SQLITE_PATH:-}" ]]; then
   DB_PATH="$(resolve_path "$SQLITE_PATH")"
 else
-  DB_NAME="${SQLITE_DB_NAME:-web_ytd.sqlite3}"
+  DB_NAME="${SQLITE_DB_NAME:-clipsave.sqlite3}"
   DB_PATH="${DATA_PATH_RESOLVED%/}/${DB_NAME}"
 fi
 
@@ -94,7 +94,7 @@ hr() {
 
 print_header() {
   hr
-  echo "Web YTD / SQLite DB tool"
+  echo "ClipSave / SQLite DB tool"
   hr
 }
 
@@ -237,7 +237,7 @@ emergency_backup_name() {
 }
 
 regular_backup_name() {
-  date -u +"web_ytd_%Y-%m-%d_%H-%M-%S.sqlite3"
+  date -u +"clipsave_%Y-%m-%d_%H-%M-%S.sqlite3"
 }
 
 vacuum_backup_name() {
@@ -531,19 +531,19 @@ do_vacuum_into() {
 show_help() {
   cat <<'EOF'
 Использование:
-  bash ytd_db.sh
-  bash ytd_db.sh status
-  bash ytd_db.sh backup
-  bash ytd_db.sh restore
-  bash ytd_db.sh restore 2
-  bash ytd_db.sh restore /путь/к/архиву.sqlite3
-  bash ytd_db.sh quick-check
-  bash ytd_db.sh integrity-check
-  bash ytd_db.sh vacuum-into
-  bash ytd_db.sh list
+  bash clipsave_db.sh
+  bash clipsave_db.sh status
+  bash clipsave_db.sh backup
+  bash clipsave_db.sh restore
+  bash clipsave_db.sh restore 2
+  bash clipsave_db.sh restore /путь/к/архиву.sqlite3
+  bash clipsave_db.sh quick-check
+  bash clipsave_db.sh integrity-check
+  bash clipsave_db.sh vacuum-into
+  bash clipsave_db.sh list
 
 Дополнительно:
-  ENV_FILE=/путь/к/.env bash ytd_db.sh status
+  ENV_FILE=/путь/к/.env bash clipsave_db.sh status
 EOF
 }
 
