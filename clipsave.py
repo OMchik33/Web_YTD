@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import sqlite3
 import sys
 import time
@@ -1515,9 +1516,13 @@ def dedupe_preserve_order(items: list[tuple[str, str]]) -> list[tuple[str, str]]
 
 def build_youtube_download_attempts(mode: str, format_id: str | None, max_height: int) -> list[tuple[str, str]]:
     """
-    YouTube may return unstable direct DASH URLs for some audio/video formats.
-    Try several full-quality strategies before giving up, instead of hanging on
-    the first automatically selected bestaudio/bestvideo pair.
+    Build a flexible YouTube download strategy list.
+
+    Do not hard-lock to one codec. YouTube can return unstable media URLs for
+    a specific video/audio pair or CDN host. The goal is to stay within the
+    requested quality limit and try several equivalent full-quality variants:
+    different audio IDs, then different video codec families, then HLS/ready
+    streams. Ready streams are kept last because they may be lower quality.
     """
     vf = youtube_video_filter(max_height)
 
@@ -1528,36 +1533,111 @@ def build_youtube_download_attempts(mode: str, format_id: str | None, max_height
     if mode == "audio":
         return dedupe_preserve_order(attempts)
 
+    # Audio order is intentionally not just "bestaudio". On some YouTube/GVS
+    # URLs the formal best audio (often 251 or 140) can hang, while 250 works.
+    audio_variants: list[tuple[str, str]] = [
+        ("Opus 70 kbps", "250"),
+        ("Opus 110/130 kbps", "251"),
+        ("M4A", "140"),
+        ("Opus 50 kbps", "249"),
+        ("Opus 70 kbps DRC", "250-drc"),
+        ("Opus 110/130 kbps DRC", "251-drc"),
+        ("M4A DRC", "140-drc"),
+    ]
+
     if mode == "pick" and format_id:
+        for audio_label, audio_fmt in audio_variants:
+            attempts.append((f"выбранный формат + {audio_label}", f"{format_id}+{audio_fmt}/{format_id}"))
         attempts.extend(
             [
-                ("выбранный формат + среднее Opus-аудио", f"{format_id}+ba[format_id^=250]/{format_id}+250/{format_id}"),
-                ("выбранный формат + Opus-аудио", f"{format_id}+ba[format_id^=251]/{format_id}+251/{format_id}"),
-                ("выбранный формат + M4A-аудио", f"{format_id}+ba[ext=m4a]/{format_id}+140/{format_id}"),
+                ("выбранный формат + любое Opus-аудио", f"{format_id}+ba[acodec^=opus]/{format_id}"),
+                ("выбранный формат + любое M4A-аудио", f"{format_id}+ba[ext=m4a]/{format_id}"),
                 ("выбранный формат + любое аудио", f"{format_id}+ba/{format_id}"),
             ]
         )
         return dedupe_preserve_order(attempts)
 
-    h264 = f"bv*[ext=mp4][vcodec^=avc1]{vf}"
-    mp4_any = f"bv*[ext=mp4]{vf}"
-    any_video = f"bv*{vf}"
-    hls_ready = f"b[protocol^=m3u8]{vf}"
+    video_variants: list[tuple[str, str]] = [
+        ("лучшее видео", f"bv*{vf}"),
+        ("MP4-видео", f"bv*[ext=mp4]{vf}"),
+        ("H.264 MP4-видео", f"bv*[ext=mp4][vcodec^=avc1]{vf}"),
+        ("VP9 WebM-видео", f"bv*[vcodec^=vp9]{vf}"),
+        ("AV1 MP4-видео", f"bv*[ext=mp4][vcodec^=av01]{vf}"),
+    ]
 
+    # First try the same quality range with several explicit audio formats.
+    for video_label, video_fmt in video_variants:
+        for audio_label, audio_fmt in audio_variants:
+            attempts.append((f"{video_label} + {audio_label}", f"{video_fmt}+{audio_fmt}"))
+
+    # Then allow yt-dlp to pick audio by codec/container, still keeping the
+    # selected video quality range. These are broader than exact IDs above.
+    for video_label, video_fmt in video_variants:
+        attempts.extend(
+            [
+                (f"{video_label} + любое Opus-аудио", f"{video_fmt}+ba[acodec^=opus]"),
+                (f"{video_label} + любое M4A-аудио", f"{video_fmt}+ba[ext=m4a]"),
+                (f"{video_label} + любое аудио", f"{video_fmt}+ba"),
+            ]
+        )
+
+    # HLS/ready streams are last. For some videos HLS is the only way to get a
+    # combined high-quality stream, but it must not skip fragments silently.
     attempts.extend(
         [
-            ("H.264 MP4 + среднее Opus-аудио", f"{h264}+ba[format_id^=250]"),
-            ("H.264 MP4 + Opus-аудио", f"{h264}+ba[format_id^=251]"),
-            ("H.264 MP4 + M4A-аудио", f"{h264}+ba[ext=m4a]"),
-            ("H.264 MP4 + любое аудио", f"{h264}+ba"),
-            ("MP4-видео + среднее Opus-аудио", f"{mp4_any}+ba[format_id^=250]"),
-            ("MP4-видео + Opus-аудио", f"{mp4_any}+ba[format_id^=251]"),
-            ("любое видео + среднее Opus-аудио", f"{any_video}+ba[format_id^=250]"),
-            ("любое видео + Opus-аудио", f"{any_video}+ba[format_id^=251]"),
-            ("HLS MP4-поток", hls_ready),
+            ("HLS MP4-поток", f"b[protocol^=m3u8][ext=mp4]{vf}"),
+            ("готовый MP4-поток", f"b[ext=mp4]{vf}"),
+            ("любой готовый поток", f"b{vf}"),
         ]
     )
+
     return dedupe_preserve_order(attempts)
+
+
+def build_youtube_audio_first_attempts(max_height: int) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """
+    Build two-phase YouTube fallback strategies.
+
+    Audio is downloaded first because YouTube/GVS can hang on a specific audio
+    media URL. Once a working audio file is downloaded, video strategies can be
+    tried without downloading audio again.
+    """
+    vf = youtube_video_filter(max_height)
+
+    audio_variants: list[tuple[str, str]] = [
+        ("Opus 70 kbps", "250"),
+        ("Opus 110/130 kbps", "251"),
+        ("M4A", "140"),
+        ("Opus 50 kbps", "249"),
+        ("Opus 70 kbps DRC", "250-drc"),
+        ("Opus 110/130 kbps DRC", "251-drc"),
+        ("M4A DRC", "140-drc"),
+        ("любое Opus-аудио", "ba[acodec^=opus]"),
+        ("любое M4A-аудио", "ba[ext=m4a]"),
+        ("любое аудио", "ba"),
+    ]
+
+    video_variants: list[tuple[str, str]] = [
+        ("лучшее видео", f"bv*{vf}"),
+        ("MP4-видео", f"bv*[ext=mp4]{vf}"),
+        ("H.264 MP4-видео", f"bv*[ext=mp4][vcodec^=avc1]{vf}"),
+        ("VP9 WebM-видео", f"bv*[vcodec^=vp9]{vf}"),
+        ("AV1 MP4-видео", f"bv*[ext=mp4][vcodec^=av01]{vf}"),
+    ]
+
+    return dedupe_preserve_order(audio_variants), dedupe_preserve_order(video_variants)
+
+
+def build_youtube_ready_stream_attempts(max_height: int) -> list[tuple[str, str]]:
+    vf = youtube_video_filter(max_height)
+    return dedupe_preserve_order(
+        [
+            ("HLS MP4-поток", f"b[protocol^=m3u8][ext=mp4]{vf}"),
+            ("готовый MP4-поток", f"b[ext=mp4]{vf}"),
+            ("любой готовый поток", f"b{vf}"),
+        ]
+    )
+
 
 
 def cleanup_temp_files_sync(task_id: str) -> None:
@@ -2088,49 +2168,306 @@ def sync_download_media(
 
     youtube_attempts = build_youtube_download_attempts(mode, format_id, max_height) if is_youtube_url(url) and mode != "audio" else []
 
+    def info_file_path(download_info: dict[str, Any]) -> str | None:
+        rds = download_info.get("requested_downloads") or []
+        if isinstance(rds, list):
+            for item in rds:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("filepath", "filename", "_filename"):
+                    value = item.get(key)
+                    if value and os.path.exists(value):
+                        return str(value)
+        for key in ("filepath", "filename", "_filename"):
+            value = download_info.get(key)
+            if value and os.path.exists(value):
+                return str(value)
+        return find_downloaded_file(download_info)
+
+    def run_ffmpeg_merge(video_path: str, audio_path: str, output_path: str) -> None:
+        audio_ext = Path(audio_path).suffix.lower()
+        if audio_ext in {".m4a", ".mp4", ".aac"}:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+        else:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+
+        schedule_task_update(
+            loop,
+            task_id,
+            status="processing",
+            status_label="Обработка",
+            detail="Склеиваю видео и аудио",
+            progress=build_progress_payload(
+                state="processing",
+                kind="determinate",
+                percent=100,
+                label="Склейка файла",
+            ),
+        )
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "ffmpeg merge failed").strip()[-2000:])
+
+    def download_youtube_audio_first_fallback(base_opts: dict[str, Any]) -> dict[str, Any]:
+        audio_attempts, video_attempts = build_youtube_audio_first_attempts(max_height)
+        last_error: Exception | None = None
+
+        for audio_index, (audio_label, audio_format) in enumerate(audio_attempts, start=1):
+            ensure_task_not_cancelled(task_id)
+            cleanup_temp_files_sync(task_id)
+
+            schedule_task_update(
+                loop,
+                task_id,
+                status="processing",
+                status_label="Подбор аудио",
+                detail=f"Пробую аудио: {audio_label}",
+            )
+
+            audio_opts = dict(base_opts)
+            audio_opts["format"] = audio_format
+            audio_opts["outtmpl"] = str(DOWNLOAD_PATH / f"webtmp_{user_id}_{task_id}_audio_%(id)s.%(format_id)s.%(ext)s")
+            audio_opts["socket_timeout"] = 10
+            audio_opts["retries"] = 1
+            audio_opts["fragment_retries"] = 1
+            audio_opts.pop("http_chunk_size", None)
+
+            logger.info(
+                "YouTube audio-first audio attempt %s/%s: %s format=%s",
+                audio_index,
+                len(audio_attempts),
+                audio_label,
+                audio_format,
+            )
+
+            try:
+                audio_info = ydl_extract_checked(audio_opts)
+                audio_path = info_file_path(audio_info)
+                if not audio_path or not os.path.exists(audio_path):
+                    raise RuntimeError("Аудиофайл не найден после скачивания.")
+            except DownloadCancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "YouTube audio-first audio attempt failed: %s format=%s err=%s",
+                    audio_label,
+                    audio_format,
+                    exc,
+                )
+                continue
+
+            for video_index, (video_label, video_format) in enumerate(video_attempts, start=1):
+                ensure_task_not_cancelled(task_id)
+
+                schedule_task_update(
+                    loop,
+                    task_id,
+                    status="processing",
+                    status_label="Подбор видео",
+                    detail=f"Аудио скачано. Пробую видео: {video_label}",
+                )
+
+                video_opts = dict(base_opts)
+                video_opts["format"] = video_format
+                video_opts["outtmpl"] = str(DOWNLOAD_PATH / f"webtmp_{user_id}_{task_id}_video_%(id)s.%(format_id)s.%(ext)s")
+                video_opts["socket_timeout"] = 10
+                video_opts["retries"] = 1
+                video_opts["fragment_retries"] = 1
+                video_opts.pop("http_chunk_size", None)
+
+                logger.info(
+                    "YouTube audio-first video attempt %s/%s with audio %s: %s format=%s",
+                    video_index,
+                    len(video_attempts),
+                    audio_label,
+                    video_label,
+                    video_format,
+                )
+
+                video_path = None
+                try:
+                    video_info = ydl_extract_checked(video_opts)
+                    video_path = info_file_path(video_info)
+                    if not video_path or not os.path.exists(video_path):
+                        raise RuntimeError("Видеофайл не найден после скачивания.")
+
+                    video_id = video_info.get("id") or audio_info.get("id") or hashlib.md5(url.encode()).hexdigest()[:12]
+                    merged_path = str(DOWNLOAD_PATH / f"webtmp_{user_id}_{task_id}_{video_id}_merged.mp4")
+                    Path(merged_path).unlink(missing_ok=True)
+                    run_ffmpeg_merge(video_path, audio_path, merged_path)
+
+                    merged_info = dict(video_info)
+                    merged_info["filepath"] = merged_path
+                    merged_info["filename"] = merged_path
+                    merged_info["_filename"] = merged_path
+                    merged_info["requested_downloads"] = [{"filepath": merged_path}]
+                    if not merged_info.get("title"):
+                        merged_info["title"] = audio_info.get("title")
+                    if not merged_info.get("thumbnail"):
+                        merged_info["thumbnail"] = audio_info.get("thumbnail")
+
+                    try:
+                        Path(video_path).unlink(missing_ok=True)
+                    except Exception:
+                        logger.exception("Failed to delete temp video %s", video_path)
+                    try:
+                        Path(audio_path).unlink(missing_ok=True)
+                    except Exception:
+                        logger.exception("Failed to delete temp audio %s", audio_path)
+
+                    return merged_info
+                except DownloadCancelledError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "YouTube audio-first video attempt failed: audio=%s video=%s format=%s err=%s",
+                        audio_label,
+                        video_label,
+                        video_format,
+                        exc,
+                    )
+                    if video_path:
+                        try:
+                            Path(video_path).unlink(missing_ok=True)
+                        except Exception:
+                            logger.exception("Failed to delete failed temp video %s", video_path)
+                    continue
+
+            try:
+                Path(audio_path).unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Failed to delete failed temp audio %s", audio_path)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Не удалось подобрать рабочую аудио/видео связку.")
+
     if youtube_attempts:
         info = None
         last_error: Exception | None = None
-        for attempt_index, (attempt_label, attempt_format) in enumerate(youtube_attempts, start=1):
-            ensure_task_not_cancelled(task_id)
-            attempt_opts = dict(opts)
-            attempt_opts["format"] = attempt_format
-            attempt_opts["socket_timeout"] = 12
-            attempt_opts["retries"] = 2
-            attempt_opts["fragment_retries"] = 2
-            attempt_opts.pop("http_chunk_size", None)
 
-            if attempt_index > 1:
+        primary_label, primary_format = youtube_attempts[0]
+        primary_opts = dict(opts)
+        primary_opts["format"] = primary_format
+        primary_opts["socket_timeout"] = 12
+        primary_opts["retries"] = 2
+        primary_opts["fragment_retries"] = 2
+        primary_opts.pop("http_chunk_size", None)
+
+        logger.info("YouTube primary download attempt: %s format=%s", primary_label, primary_format)
+
+        try:
+            info = ydl_extract_checked(primary_opts)
+        except DownloadCancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning("YouTube primary download attempt failed: %s format=%s err=%s", primary_label, primary_format, exc)
+
+        if info is None and mode != "pick":
+            try:
                 cleanup_temp_files_sync(task_id)
                 schedule_task_update(
                     loop,
                     task_id,
                     status="processing",
                     status_label="Повторная попытка",
-                    detail=f"Пробую резервный вариант: {attempt_label}",
+                    detail="Пробую резервный режим: сначала аудио, потом видео",
                 )
-
-            logger.info(
-                "YouTube download attempt %s/%s: %s format=%s",
-                attempt_index,
-                len(youtube_attempts),
-                attempt_label,
-                attempt_format,
-            )
-
-            try:
-                info = ydl_extract_checked(attempt_opts)
-                break
+                info = download_youtube_audio_first_fallback(opts)
             except DownloadCancelledError:
                 raise
             except Exception as exc:
                 last_error = exc
-                logger.warning(
-                    "YouTube download attempt failed: %s format=%s err=%s",
+                logger.warning("YouTube audio-first fallback failed. err=%s", exc)
+
+        if info is None:
+            ready_attempts = build_youtube_ready_stream_attempts(max_height)
+            for attempt_index, (attempt_label, attempt_format) in enumerate(ready_attempts, start=1):
+                ensure_task_not_cancelled(task_id)
+                cleanup_temp_files_sync(task_id)
+
+                schedule_task_update(
+                    loop,
+                    task_id,
+                    status="processing",
+                    status_label="Повторная попытка",
+                    detail=f"Пробую готовый поток: {attempt_label}",
+                )
+
+                attempt_opts = dict(opts)
+                attempt_opts["format"] = attempt_format
+                attempt_opts["socket_timeout"] = 12
+                attempt_opts["retries"] = 2
+                attempt_opts["fragment_retries"] = 2
+                attempt_opts.pop("http_chunk_size", None)
+
+                logger.info(
+                    "YouTube ready-stream attempt %s/%s: %s format=%s",
+                    attempt_index,
+                    len(ready_attempts),
                     attempt_label,
                     attempt_format,
-                    exc,
                 )
+
+                try:
+                    info = ydl_extract_checked(attempt_opts)
+                    break
+                except DownloadCancelledError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "YouTube ready-stream attempt failed: %s format=%s err=%s",
+                        attempt_label,
+                        attempt_format,
+                        exc,
+                    )
 
         if info is None:
             if last_error is None:
