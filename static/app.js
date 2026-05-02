@@ -45,6 +45,7 @@ const taskWatchLink = document.getElementById('task-watch-link');
 const taskError = document.getElementById('task-error');
 const taskProgress = document.getElementById('task-progress');
 const taskCancelBtn = document.getElementById('task-cancel-btn');
+const taskSection = taskBox ? taskBox.closest('.section-card') : null;
 
 const inviteCreateForm = document.getElementById('invite-create-form');
 const inviteCreateBtn = document.getElementById('invite-create-btn');
@@ -86,6 +87,16 @@ let lastAdminOverview = null;
 
 function apiUrl(path) {
   return `${basePath}${path}`;
+}
+
+function smoothScrollToElement(element, block = 'start') {
+  if (!element || typeof element.scrollIntoView !== 'function') {
+    return;
+  }
+
+  window.requestAnimationFrame(() => {
+    element.scrollIntoView({ behavior: 'smooth', block });
+  });
 }
 
 function setCookie(name, value, days = 180) {
@@ -509,6 +520,7 @@ function updateTaskUi(task) {
       completedNotifiedTaskIds.add(notifyKey);
       playSuccessSound();
       showToast('Файл готов. Можно скачивать.', 'success', 5000);
+      smoothScrollToElement(taskResult, 'center');
     }
   } else if (task.status === 'error') {
     setTaskBadgeState('error');
@@ -622,6 +634,7 @@ async function startDownload(mode, formatId = null) {
     currentTaskId = data.task_id;
 
     setTaskVisible();
+    smoothScrollToElement(taskSection || taskBox);
     setTaskBadgeState('active');
     setTaskProgressState('active', data.progress);
 

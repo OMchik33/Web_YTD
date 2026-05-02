@@ -28,6 +28,10 @@ APT_PACKAGES="git ca-certificates curl unzip ffmpeg python3 python3-venv python3
 ANGIE_REPO_CHANNEL="main"
 ACME_RESOLVER="1.1.1.1 1.0.0.1 valid=300s ipv6=off"
 NODEJS_MAJOR="22"
+BGUTIL_POT_PROVIDER_VERSION="1.3.1"
+BGUTIL_POT_DIR="/opt/bgutil-ytdlp-pot-provider"
+BGUTIL_POT_SERVICE="bgutil-pot"
+BGUTIL_POT_REPO_URL="https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
 
 if [[ -n "${VERSIONS_FILE}" && -f "${VERSIONS_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -227,6 +231,17 @@ install_nodejs_runtime() {
   echo "Node.js: $(command -v node) $(node -v)"
 }
 
+
+install_bgutil_pot_provider() {
+  echo "==> Установка PO Token Provider для yt-dlp / YouTube GVS"
+  VENV_DIR="${VENV_DIR}" \
+  BGUTIL_POT_PROVIDER_VERSION="${BGUTIL_POT_PROVIDER_VERSION}" \
+  BGUTIL_POT_DIR="${BGUTIL_POT_DIR}" \
+  BGUTIL_POT_SERVICE="${BGUTIL_POT_SERVICE}" \
+  BGUTIL_POT_REPO_URL="${BGUTIL_POT_REPO_URL}" \
+    bash "${APP_DIR}/scripts/install_bgutil_pot.sh"
+}
+
 echo "==> Подготовка базовых пакетов"
 apt-get update
 apt-get install -y ca-certificates curl git gnupg
@@ -360,6 +375,7 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
   sudo -u "${APP_USER}" -H python3 -m venv "${VENV_DIR}"
 fi
 sudo -u "${APP_USER}" -H bash -lc "source '${VENV_DIR}/bin/activate' && pip install --upgrade pip setuptools wheel && pip install -r '${APP_DIR}/requirements.txt'"
+install_bgutil_pot_provider
 
 ENV_FILE="${APP_DIR}/.env"
 if [[ ! -f "${ENV_FILE}" ]]; then
@@ -493,7 +509,7 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Автоудаление скачанных файлов выполняет сам веб-сервис ClipSave через SQLite-настройки.
-0 4 * * * root before=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); /usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && pip install -U --no-deps yt-dlp yt-dlp-ejs'; after=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; print(\\"yt-dlp=\\"+m.version(\\"yt-dlp\\") if \"yt-dlp\" in m.packages_distributions() else \\\"yt-dlp=NOT_INSTALLED\\\"); print(\\"yt-dlp-ejs=\\"+m.version(\\"yt-dlp-ejs\\") if \"yt-dlp-ejs\" in m.packages_distributions() else \\\"yt-dlp-ejs=NOT_INSTALLED\\\")"'); [ "\$before" != "\$after" ] && /usr/bin/systemctl restart ${APP_SERVICE} || true
+0 4 * * * root before=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; pkgs=m.packages_distributions(); names=(\"yt-dlp\",\"yt-dlp-ejs\",\"bgutil-ytdlp-pot-provider\"); [print(f\"{n}=\" + (m.version(n) if n in pkgs else \"NOT_INSTALLED\")) for n in names]"'); /usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && pip install -U --no-deps yt-dlp yt-dlp-ejs bgutil-ytdlp-pot-provider'; after=\$(/usr/bin/sudo -u ${APP_USER} -H bash -lc 'source ${VENV_DIR}/bin/activate && python -c "import importlib.metadata as m; pkgs=m.packages_distributions(); names=(\"yt-dlp\",\"yt-dlp-ejs\",\"bgutil-ytdlp-pot-provider\"); [print(f\"{n}=\" + (m.version(n) if n in pkgs else \"NOT_INSTALLED\")) for n in names]"'); [ "\$before" != "\$after" ] && /usr/bin/systemctl restart ${APP_SERVICE} || true
 CRONEOF
 chmod 644 /etc/cron.d/clipsave
 
@@ -520,6 +536,8 @@ echo "Полезные команды:"
 echo "  systemctl status ${APP_SERVICE} --no-pager"
 echo "  node -v"
 echo "  systemctl status angie --no-pager"
+echo "  systemctl status ${BGUTIL_POT_SERVICE} --no-pager"
+echo "  curl -sS http://127.0.0.1:4416/ping"
 echo "  ufw status verbose"
 echo "  grep -i acme /var/log/angie/error.log | tail -n 50"
 echo "  ls -la /var/lib/angie/acme/le/"
